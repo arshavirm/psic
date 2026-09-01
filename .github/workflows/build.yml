@@ -22,9 +22,6 @@ jobs:
           - name: Linux arm64
             runner: ubuntu-24.04-arm
             artifact: psic-linux-arm64
-          - name: macOS Intel
-            runner: macos-13
-            artifact: psic-macos-x86_64
           - name: macOS Apple Silicon
             runner: macos-14
             artifact: psic-macos-arm64
@@ -53,11 +50,20 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          choco install llvm --yes --no-progress
+          choco install llvm --version=18.1.8 --allow-downgrade --yes --no-progress
           choco install ninja --yes --no-progress
           "LLVM_DIR=$env:ProgramFiles\LLVM\lib\cmake\llvm" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Configure
+      - name: Configure (Unix)
+        if: runner.os != 'Windows'
+        run: >
+          cmake -S . -B build-ci -G Ninja
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DLLVM_DIR="${LLVM_DIR}"
+
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
         run: >
           cmake -S . -B build-ci -G Ninja
           -DCMAKE_BUILD_TYPE=RelWithDebInfo
