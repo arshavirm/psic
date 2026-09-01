@@ -17,19 +17,43 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 include_directories(${LLVM_INCLUDE_DIRS})
 add_definitions(${LLVM_DEFINITIONS})
 
-llvm_map_components_to_libnames(llvm_libs -18)
-
 file(GLOB_RECURSE SRC ${PROJECT_SOURCE_DIR}/src/*.cpp)
 
 add_executable(psic ${SRC})
 
-target_compile_options(psic PRIVATE
-    $<$<CONFIG:Debug>:-g -O0 -Wall -Wextra>
-    $<$<CONFIG:Release>:-O3 -DNDEBUG -march=native>
-    $<$<CONFIG:RelWithDebInfo>:-O2 -g -DNDEBUG>
-)
+if(MSVC)
+    target_compile_options(psic PRIVATE
+        /W4
+        $<$<CONFIG:Debug>:/Od /Zi>
+        $<$<CONFIG:Release>:/O2 /DNDEBUG>
+        $<$<CONFIG:RelWithDebInfo>:/O2 /Zi /DNDEBUG>
+    )
+else()
+    target_compile_options(psic PRIVATE
+        $<$<CONFIG:Debug>:-g -O0 -Wall -Wextra>
+        $<$<CONFIG:Release>:-O3 -DNDEBUG -march=native>
+        $<$<CONFIG:RelWithDebInfo>:-O2 -g -DNDEBUG>
+    )
+endif()
 
-target_link_libraries(psic PRIVATE ${llvm_libs})
+
+if(TARGET LLVM)
+    target_link_libraries(psic PRIVATE LLVM)
+else()
+    llvm_map_components_to_libnames(llvm_libs
+        core
+        irreader
+        passes
+        support
+        target
+        targetparser
+        AllTargetsCodeGens
+        AllTargetsAsmParsers
+        AllTargetsDescs
+        AllTargetsInfos
+    )
+    target_link_libraries(psic PRIVATE ${llvm_libs})
+endif()
 
 option(PSIC_SANITIZE "Enable Sanitizers for debugging" OFF)
 if(PSIC_SANITIZE)
