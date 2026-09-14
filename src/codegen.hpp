@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ast.hpp"
+#include <psic/compiler.hpp>
 #include "logging.hpp"
 
 #include <string>
@@ -9,7 +10,20 @@ enum class Architecture {
     X86,
     X86_64,
     AArch64,
-    ARM
+    ARM,
+    WASM32,
+    WASM64,
+    RISCV32,
+    RISCV64,
+    PPC32,
+    PPC64,
+    PPC64LE,
+    MIPS,
+    MIPSEL,
+    MIPS64,
+    MIPS64EL,
+    LoongArch64,
+    SystemZ,
 };
 
 enum class OperatingSystem {
@@ -17,24 +31,18 @@ enum class OperatingSystem {
     Darwin,
     Windows,
     FreeStanding,
+    WASI,
 };
 
-enum class OptLevel {
-    O0,
-    O1,
-    O2,
-    O3,
-    Os,
-    Oz,
-};
+using OptLevel = psic::OptimizationLevel;
 
-std::string compileProgram(std::string name, ProgramNode program, Architecture arch, OperatingSystem os);
+std::string compileProgram(std::string name, ProgramNode program, Architecture arch, OperatingSystem os, const std::string& targetTriple = "");
 
 std::string optimizeIR(const std::string& irCode, OptLevel level, std::string& errorMessage);
 
-bool compileToObjectFile(
+bool compileToObjectMemory(
     const std::string& irCode,
     const std::string& targetTriple,
-    const std::string& outputPath,
+    std::vector<std::uint8_t>& output,
     OptLevel level,
     std::string& errorMessage);

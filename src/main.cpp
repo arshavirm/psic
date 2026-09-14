@@ -6,11 +6,10 @@
 #include <string>
 #include <vector>
 
-#include "ast.hpp"
-#include "codegen.hpp"
-#include "lexer.hpp"
+#include <psic/compiler.hpp>
 #include "logging.hpp"
-#include "parser.hpp"
+
+using OptLevel = psic::OptimizationLevel;
 
 const std::string BANNER = R"(
 █████ █████ █████
@@ -57,8 +56,14 @@ static void printUsage(std::ostream& out)
         << "  x86                       32-bit x86\n"
         << "  x86_64, x86-64, amd64     64-bit x86\n"
         << "  aarch64                   64-bit ARM\n"
-        << "  arm                       32-bit ARM\n\n"
+        << "  arm                       32-bit ARM\n"
+        << "  wasm, wasm32, wasm64      WebAssembly (default OS: none)\n"
+        << "  riscv32, riscv64          RISC-V\n"
+        << "  ppc, ppc64, ppc64le       PowerPC\n"
+        << "  mips, mipsel, mips64, mips64el\n"
+        << "  loongarch64, s390x        LoongArch / SystemZ\n\n"
         << "Operating systems:\n"
+        << "  wasi                      WebAssembly System Interface\n"
         << "  linux                     Linux (default)\n"
         << "  darwin, macos             macOS\n"
         << "  windows, win32            Windows\n"
@@ -253,97 +258,6 @@ static bool parseArguments(int argc, char** argv, Options& options)
     return true;
 }
 
-Architecture pickArchitecture(const std::string& explicitArch,
-    const std::string& targetTriple)
-{
-    if (explicitArch == "x86") {
-        return Architecture::X86;
-    }
-
-    if (explicitArch == "x86_64" || explicitArch == "x86-64" || explicitArch == "amd64") {
-        return Architecture::X86_64;
-    }
-
-    if (explicitArch == "aarch64") {
-        return Architecture::AArch64;
-    }
-
-    if (explicitArch == "arm") {
-        return Architecture::ARM;
-    }
-
-    if (!explicitArch.empty()) {
-        throw std::runtime_error("unknown architecture '" + explicitArch + "'");
-    }
-
-    if (!targetTriple.empty()) {
-        if (targetTriple.rfind("x86_64", 0) == 0 || targetTriple.rfind("amd64", 0) == 0) {
-            return Architecture::X86_64;
-        }
-
-        if (targetTriple.rfind("i386", 0) == 0 || targetTriple.rfind("i486", 0) == 0 || targetTriple.rfind("i586", 0) == 0 || targetTriple.rfind("i686", 0) == 0 || targetTriple.rfind("x86-", 0) == 0) {
-            return Architecture::X86;
-        }
-
-        if (targetTriple.rfind("aarch64", 0) == 0) {
-            return Architecture::AArch64;
-        }
-
-        if (targetTriple.rfind("armv7", 0) == 0) {
-            return Architecture::ARM;
-        }
-
-        throw std::runtime_error(
-            "cannot determine architecture from target triple '" + targetTriple + "'");
-    }
-
-    return Architecture::X86_64;
-}
-
-OperatingSystem pickOperatingSystem(const std::string& explicitOs,
-    const std::string& targetTriple)
-{
-    if (explicitOs == "linux") {
-        return OperatingSystem::Linux;
-    }
-
-    if (explicitOs == "darwin" || explicitOs == "macos" || explicitOs == "macosx") {
-        return OperatingSystem::Darwin;
-    }
-
-    if (explicitOs == "windows" || explicitOs == "win32") {
-        return OperatingSystem::Windows;
-    }
-
-    if (explicitOs == "none" || explicitOs == "freestanding" || explicitOs == "bare-metal") {
-        return OperatingSystem::FreeStanding;
-    }
-
-    if (!explicitOs.empty()) {
-        throw std::runtime_error("unknown OS '" + explicitOs + "'");
-    }
-
-    if (!targetTriple.empty()) {
-        if (targetTriple.find("linux") != std::string::npos) {
-            return OperatingSystem::Linux;
-        }
-        if (targetTriple.find("apple") != std::string::npos || targetTriple.find("darwin") != std::string::npos || targetTriple.find("macos") != std::string::npos || targetTriple.find("ios") != std::string::npos) {
-            return OperatingSystem::Darwin;
-        }
-        if (targetTriple.find("windows") != std::string::npos) {
-            return OperatingSystem::Windows;
-        }
-        if (targetTriple.find("-none") != std::string::npos) {
-            return OperatingSystem::FreeStanding;
-        }
-
-        throw std::runtime_error(
-            "cannot determine OS from target triple '" + targetTriple + "' - pass -mos explicitly");
-    }
-
-    return OperatingSystem::Linux;
-}
-
 static std::string defaultOutputPath(const std::string& input, bool emitIR)
 {
     if (input == "-")
@@ -439,66 +353,44 @@ int main(int argc, char** argv)
     const std::string name = options.input == "-" ? "stdin" : options.input;
 
     try {
-        psi::logInfo("Lexing...");
-        Lexer lexer(source);
-        std::vector<Token> tokens = lexer.tokenize();
-
-        psi::logInfo("Parsing...");
-        Parser parser(tokens);
-        ProgramNode program = parser.parseProgram();
-
-        Architecture arch = pickArchitecture(options.arch, options.targetTriple);
-        OperatingSystem os = pickOperatingSystem(options.os, options.targetTriple);
-
-        if (options.verbose) {
-            psi::logInfo("Input:  " + options.input);
-            psi::logInfo("Output: " + options.output);
-            psi::logInfo("Target: " + options.targetTriple);
-            psi::logInfo("Arch:   " + options.arch);
-            psi::logInfo("OS:     " + options.os);
-            psi::logInfo("Optimization: " + std::to_string(static_cast<int>(options.opt)));
-            psi::logInfo("Generating IR...");
+        psic::CompileOptions compileOptions;
+        compileOptions.moduleName = name;
+        compileOptions.architecture = options.arch;
+        compileOptions.operatingSystem = options.os;
+        compileOptions.targetTriple = options.targetTriple;
+        compileOptions.optimization = options.opt;
+        compileOptions.output = options.emitIR ? psic::OutputKind::LLVMIR : psic::OutputKind::Object;
+        psi::logInfo("Compiling " + name + "...");
+        auto result = psic::compile(source, compileOptions);
+        for (const auto& diagnostic : result.diagnostics) {
+            switch (diagnostic.severity) {
+            case psic::DiagnosticSeverity::Error: psi::logError(diagnostic.message); break;
+            case psic::DiagnosticSeverity::Warning: psi::logWarning(diagnostic.message); break;
+            case psic::DiagnosticSeverity::Note: psi::logNote(diagnostic.message); break;
+            }
         }
-
-        psi::logInfo("Compiling to IR...");
-        std::string ir = compileProgram(name, program, arch, os);
-
-        if (psi::hadErrors()) {
-            psi::logError("compilation failed with " + std::to_string(psi::errorCount()) + " error(s)");
-            return 1;
-        }
-
+        if (!result.success) return 1;
         if (options.emitIR) {
-            if (!writeIR(ir, options.output)) {
+            if (!writeIR(result.ir, options.output)) return 1;
+        } else {
+            if (options.output == "-") {
+                psi::logError("object output to stdout is not supported; specify an output file");
                 return 1;
             }
-
-            if (options.verbose) {
-                psi::logInfo("Successfully wrote " + options.output);
-            } else if (options.output != "-") {
-                std::cout << "psic: emitted LLVM IR " << options.input << " -> " << options.output
-                          << "\n";
+            std::ofstream output(options.output, std::ios::binary);
+            if (!output) {
+                psi::logError("cannot open output file '" + options.output + "'");
+                return 1;
             }
-            return 0;
+            output.write(reinterpret_cast<const char*>(result.object.data()), result.object.size());
+            output.close();
+            if (!output) {
+                psi::logError("error writing output file '" + options.output + "'");
+                return 1;
+            }
         }
-
-        if (options.verbose) {
-            psi::logInfo("Generating object file...");
-        }
-
-        std::string errorMessage;
-        if (!compileToObjectFile(
-                ir, options.targetTriple, options.output, options.opt, errorMessage)) {
-            psi::logError("object file generation failed: " + errorMessage);
-            return 1;
-        }
-
-        if (options.verbose) {
-            psi::logInfo("Successfully wrote " + options.output);
-        } else {
+        if (options.output != "-")
             std::cout << "psic: compiled " << options.input << " -> " << options.output << "\n";
-        }
-
         return 0;
     } catch (const std::exception& error) {
         psi::logError(error.what());

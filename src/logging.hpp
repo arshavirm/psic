@@ -2,8 +2,11 @@
 
 #include <sstream>
 #include <string>
+#include <psic/compiler.hpp>
 
 namespace psi {
+
+std::vector<psic::Diagnostic>* setDiagnosticSink(std::vector<psic::Diagnostic>* sink);
 
 void logError(const std::string& message);
 void logWarning(const std::string& message);

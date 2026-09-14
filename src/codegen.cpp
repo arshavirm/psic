@@ -2,11 +2,16 @@
 
 #include <llvm/Analysis/CGSCCPassManager.h>
 #include <llvm/IR/Constants.h>
+#include <llvm/IR/DiagnosticInfo.h>
+#include <llvm/IR/DiagnosticPrinter.h>
 #include <llvm/IR/DerivedTypes.h>
 #include <llvm/IR/GlobalVariable.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/InlineAsm.h>
 #include <llvm/IR/Instructions.h>
+#include <llvm/IR/IntrinsicsWebAssembly.h>
+#include <llvm/IR/IntrinsicsX86.h>
+#include <algorithm>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/Module.h>
@@ -26,6 +31,17 @@
 #include <llvm/Target/TargetOptions.h>
 #include <llvm/TargetParser/Host.h>
 #include <unordered_map>
+
+static void captureLLVMDiagnostic(const llvm::DiagnosticInfo* info, void*)
+{
+    std::string message;
+    llvm::raw_string_ostream stream(message);
+    llvm::DiagnosticPrinterRawOStream printer(stream);
+    info->print(printer);
+    if (info->getSeverity() == llvm::DS_Error) psi::logError(message);
+    else if (info->getSeverity() == llvm::DS_Warning) psi::logWarning(message);
+    else if (info->getSeverity() == llvm::DS_Note) psi::logNote(message);
+}
 
 std::unordered_map<std::string, llvm::Type*> types;
 
@@ -87,12 +103,19 @@ llvm::Constant* buildConstant(ValueNode* value, const TypeNode& declaredType, ll
             double d = value->numberIsFloat ? value->numberAsFloat : (double)value->numberAsInt;
             return llvm::ConstantFP::get(targetType, d);
         }
+        if (!targetType->isIntegerTy()) {
+            psi::logError("numeric global initializer requires an integer or floating type");
+            return nullptr;
+        }
         long long i = value->numberIsFloat ? (long long)value->numberAsFloat : value->numberAsInt;
         return llvm::ConstantInt::get(targetType, (uint64_t)i, true);
     }
 
     if (value->kind == ValueKind::String) {
-
+        if (!targetType->isPointerTy()) {
+            psi::logError("string initializer requires a pointer type");
+            return nullptr;
+        }
         return buildStringConstant(module, value->stringValue);
     }
 
@@ -159,6 +182,8 @@ enum class RegisterWidth {
 struct SpecialRegisterInfo {
     std::string constraint;
     RegisterWidth width;
+    std::string readAsm;
+    std::string writeAsm;
 };
 
 std::unordered_map<std::string, SpecialRegisterInfo> special_registers;
@@ -184,7 +209,7 @@ llvm::Type* widthToType(RegisterWidth width, llvm::LLVMContext& context)
 
 void addRegister(const std::string& name, RegisterWidth width)
 {
-    special_registers[name] = SpecialRegisterInfo { "{" + name + "}", width };
+    special_registers[name] = SpecialRegisterInfo { "{" + name + "}", width, "", "" };
 }
 
 static bool isAArch64(Architecture arch)
@@ -285,6 +310,99 @@ void buildSpecialRegisterTable(Architecture arch)
         for (int i = 0; i < 16; ++i)
             addRegister("d" + std::to_string(i), RegisterWidth::F64);
     }
+    if (arch == Architecture::RISCV32 || arch == Architecture::RISCV64) {
+        auto width = arch == Architecture::RISCV64 ? RegisterWidth::I64 : RegisterWidth::I32;
+        static const char* aliases[] = {"zero", "ra", "sp", "gp", "tp", "t0", "t1", "t2",
+            "s0", "s1", "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7",
+            "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11", "t3", "t4", "t5", "t6"};
+        for (int i = 0; i < 32; ++i) {
+            std::string name = "x" + std::to_string(i);
+            addRegister(name, width);
+            special_registers[aliases[i]] = special_registers[name];
+        }
+        special_registers["fp"] = special_registers["x8"];
+    }
+    if (arch == Architecture::PPC32 || arch == Architecture::PPC64 || arch == Architecture::PPC64LE) {
+        for (int i = 0; i < 32; ++i) {
+            addRegister("r" + std::to_string(i), arch == Architecture::PPC32 ? RegisterWidth::I32 : RegisterWidth::I64);
+            addRegister("f" + std::to_string(i), RegisterWidth::F64);
+        }
+        special_registers["sp"] = special_registers["r1"];
+    }
+    if (arch == Architecture::MIPS || arch == Architecture::MIPSEL
+        || arch == Architecture::MIPS64 || arch == Architecture::MIPS64EL) {
+        const bool wide = arch == Architecture::MIPS64 || arch == Architecture::MIPS64EL;
+        static const char* aliases[] = {"zero", "at", "v0", "v1", "a0", "a1", "a2", "a3",
+            "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7", "s0", "s1", "s2", "s3",
+            "s4", "s5", "s6", "s7", "t8", "t9", "k0", "k1", "gp", "sp", "fp", "ra"};
+        for (int i = 0; i < 32; ++i) {
+            std::string name = "r" + std::to_string(i);
+            special_registers[name] = {"{$" + std::to_string(i) + "}", wide ? RegisterWidth::I64 : RegisterWidth::I32, "", ""};
+            if (!wide || i < 8 || i >= 16) special_registers[aliases[i]] = special_registers[name];
+        }
+        if (wide) {
+            for (int i = 4; i < 8; ++i) special_registers["a" + std::to_string(i)] = special_registers["r" + std::to_string(i + 4)];
+            for (int i = 0; i < 4; ++i) special_registers["t" + std::to_string(i)] = special_registers["r" + std::to_string(i + 12)];
+        }
+    }
+    if (arch == Architecture::LoongArch64) {
+        for (int i = 0; i < 32; ++i) addRegister("r" + std::to_string(i), RegisterWidth::I64);
+        special_registers["zero"] = special_registers["r0"];
+        special_registers["ra"] = special_registers["r1"];
+        special_registers["tp"] = special_registers["r2"];
+        special_registers["sp"] = special_registers["r3"];
+        special_registers["fp"] = special_registers["r22"];
+        for (int i = 0; i < 8; ++i) special_registers["a" + std::to_string(i)] = special_registers["r" + std::to_string(i + 4)];
+    }
+    if (arch == Architecture::SystemZ) {
+        for (int i = 0; i < 16; ++i) {
+            addRegister("r" + std::to_string(i), RegisterWidth::I64);
+            addRegister("f" + std::to_string(i), RegisterWidth::F64);
+        }
+        special_registers["sp"] = special_registers["r15"];
+    }
+
+    auto systemRegister = [&](const std::string& name, RegisterWidth width,
+                              const std::string& read, const std::string& write = "") {
+        special_registers[name] = {"r", width, read, write};
+    };
+    if (isAArch64(arch)) {
+        systemRegister("nzcv", RegisterWidth::I64, "mrs $0, NZCV", "msr NZCV, $0");
+        systemRegister("fpcr", RegisterWidth::I64, "mrs $0, FPCR", "msr FPCR, $0");
+        systemRegister("fpsr", RegisterWidth::I64, "mrs $0, FPSR", "msr FPSR, $0");
+        systemRegister("cntvct_el0", RegisterWidth::I64, "mrs $0, CNTVCT_EL0");
+        systemRegister("cntfrq_el0", RegisterWidth::I64, "mrs $0, CNTFRQ_EL0");
+        systemRegister("tpidr_el0", RegisterWidth::I64, "mrs $0, TPIDR_EL0", "msr TPIDR_EL0, $0");
+    }
+    if (isARM32(arch)) {
+        special_registers["r13"] = special_registers["sp"];
+        special_registers["r14"] = special_registers["lr"];
+        systemRegister("apsr", RegisterWidth::I32, "mrs $0, APSR", "msr APSR_nzcvq, $0");
+    }
+    if (arch == Architecture::RISCV32 || arch == Architecture::RISCV64) {
+        auto width = arch == Architecture::RISCV64 ? RegisterWidth::I64 : RegisterWidth::I32;
+        systemRegister("cycle", width, "rdcycle $0");
+        systemRegister("time", width, "rdtime $0");
+        systemRegister("instret", width, "rdinstret $0");
+        if (arch == Architecture::RISCV32) {
+            systemRegister("cycleh", width, "rdcycleh $0");
+            systemRegister("timeh", width, "rdtimeh $0");
+            systemRegister("instreth", width, "rdinstreth $0");
+        }
+    }
+    if (arch == Architecture::PPC32 || arch == Architecture::PPC64 || arch == Architecture::PPC64LE) {
+        auto width = arch == Architecture::PPC32 ? RegisterWidth::I32 : RegisterWidth::I64;
+        systemRegister("lr", width, "mflr $0", "mtlr $0");
+        systemRegister("ctr", width, "mfctr $0", "mtctr $0");
+        systemRegister("xer", width, "mfxer $0", "mtxer $0");
+    }
+    if (arch == Architecture::MIPS || arch == Architecture::MIPSEL
+        || arch == Architecture::MIPS64 || arch == Architecture::MIPS64EL) {
+        auto width = arch == Architecture::MIPS64 || arch == Architecture::MIPS64EL ? RegisterWidth::I64 : RegisterWidth::I32;
+        systemRegister("hi", width, "mfhi $0", "mthi $0");
+        systemRegister("lo", width, "mflo $0", "mtlo $0");
+    }
+
 }
 
 struct RegisterAddress {
@@ -428,8 +546,28 @@ bool isDeclaredUnsigned(const ValueNode& value)
     return isUnsignedTypeName(type.baseName);
 }
 
+static bool isWasm()
+{
+    return current_architecture == Architecture::WASM32 || current_architecture == Architecture::WASM64;
+}
+
+static llvm::Value* wasmMemorySize(llvm::IRBuilder<>* builder)
+{
+    auto* word = builder->getIntNTy(current_architecture == Architecture::WASM64 ? 64 : 32);
+    auto* fn = llvm::Intrinsic::getDeclaration(builder->GetInsertBlock()->getModule(),
+        llvm::Intrinsic::wasm_memory_size, {word});
+    return builder->CreateCall(fn, {builder->getInt32(0)});
+}
+
 llvm::Value* processSpecialRegisterRead(const SpecialRegNode& reg, llvm::IRBuilder<>* builder)
 {
+    if (reg.name == "mxcsr" && (current_architecture == Architecture::X86 || current_architecture == Architecture::X86_64)) {
+        auto* slot = builder->CreateAlloca(builder->getInt32Ty());
+        auto* fn = llvm::Intrinsic::getDeclaration(builder->GetInsertBlock()->getModule(), llvm::Intrinsic::x86_sse_stmxcsr);
+        builder->CreateCall(fn, {slot});
+        return builder->CreateLoad(builder->getInt32Ty(), slot);
+    }
+    if (isWasm() && reg.name == "memory_pages") return wasmMemorySize(builder);
     auto it = special_registers.find(reg.name);
     if (it == special_registers.end()) {
         psi::ErrorStream() << "'%" << reg.name << "' isn't a recognized register for this target\n";
@@ -438,7 +576,7 @@ llvm::Value* processSpecialRegisterRead(const SpecialRegNode& reg, llvm::IRBuild
 
     llvm::Type* type = widthToType(it->second.width, *current_context);
     auto* asmType = llvm::FunctionType::get(type, false);
-    auto* asmFn = llvm::InlineAsm::get(asmType, "", "=" + it->second.constraint, true);
+    auto* asmFn = llvm::InlineAsm::get(asmType, it->second.readAsm, "=" + it->second.constraint, true);
     return builder->CreateCall(asmFn);
 }
 
@@ -631,12 +769,35 @@ llvm::Value* processRefInstruction(CommandNode& command, llvm::IRBuilder<>* buil
 
 void processSpecialRegisterWrite(const SpecialRegNode& reg, llvm::Value* value, llvm::IRBuilder<>* builder)
 {
+    if (reg.name == "mxcsr" && (current_architecture == Architecture::X86 || current_architecture == Architecture::X86_64)) {
+        if (!value->getType()->isIntegerTy()) {
+            psi::ErrorStream() << "'%mxcsr' requires an integer\n";
+            return;
+        }
+        auto* slot = builder->CreateAlloca(builder->getInt32Ty());
+        builder->CreateStore(builder->CreateZExtOrTrunc(value, builder->getInt32Ty()), slot);
+        auto* fn = llvm::Intrinsic::getDeclaration(builder->GetInsertBlock()->getModule(), llvm::Intrinsic::x86_sse_ldmxcsr);
+        builder->CreateCall(fn, {slot});
+        return;
+    }
+    if (isWasm() && reg.name == "memory_pages") {
+        psi::ErrorStream() << "'%memory_pages' is read-only; use #memory_grow\n";
+        return;
+    }
     auto it = special_registers.find(reg.name);
     if (it == special_registers.end()) {
         psi::ErrorStream() << "'%" << reg.name << "' isn't a recognized register for this target\n";
         return;
     }
 
+    if ((!it->second.readAsm.empty() && it->second.writeAsm.empty())
+        || ((current_architecture == Architecture::RISCV32 || current_architecture == Architecture::RISCV64)
+            && it->second.constraint == "{x0}")
+        || (current_architecture == Architecture::LoongArch64 && it->second.constraint == "{r0}")
+        || it->second.constraint == "{$0}") {
+        psi::ErrorStream() << "'%" << reg.name << "' is read-only\n";
+        return;
+    }
     llvm::Type* type = widthToType(it->second.width, *current_context);
     if (value->getType() != type) {
         if (value->getType()->isIntegerTy() && type->isIntegerTy()) {
@@ -650,15 +811,21 @@ void processSpecialRegisterWrite(const SpecialRegNode& reg, llvm::Value* value, 
     }
 
     auto* asmType = llvm::FunctionType::get(llvm::Type::getVoidTy(*current_context), { type }, false);
-    auto* asmFn = llvm::InlineAsm::get(asmType, "", it->second.constraint, true);
+    std::string constraints = it->second.constraint;
+    if (!it->second.writeAsm.empty()) {
+        if (reg.name == "nzcv" || reg.name == "apsr") constraints += ",~{cc}";
+        else if (reg.name == "lr" || reg.name == "ctr" || reg.name == "xer"
+            || reg.name == "hi" || reg.name == "lo") constraints += ",~{" + reg.name + "}";
+        constraints += ",~{memory}";
+    }
+    auto* asmFn = llvm::InlineAsm::get(asmType, it->second.writeAsm, constraints, true);
     builder->CreateCall(asmFn, { value });
 }
 
 llvm::Value* processSyscallInstruction(CommandNode& command, llvm::IRBuilder<>* builder)
 {
-    if (current_os == OperatingSystem::FreeStanding) {
-        psi::ErrorStream() << "'#syscall' needs a target OS - there's no syscall ABI "
-                              "on a freestanding/bare-metal target\n";
+    if (current_os != OperatingSystem::Linux) {
+        psi::ErrorStream() << "'#syscall' currently supports only the Linux syscall ABI\n";
 
         return nullptr;
     }
@@ -675,7 +842,8 @@ llvm::Value* processSyscallInstruction(CommandNode& command, llvm::IRBuilder<>* 
         return nullptr;
     }
 
-    const bool wide = current_architecture == Architecture::X86_64 || isAArch64(current_architecture);
+    const bool wide = current_architecture == Architecture::X86_64 || isAArch64(current_architecture)
+        || current_architecture == Architecture::RISCV64;
 
     llvm::Type* wordType = wide
         ? llvm::Type::getInt64Ty(*current_context)
@@ -760,6 +928,12 @@ llvm::Value* processSyscallInstruction(CommandNode& command, llvm::IRBuilder<>* 
 
         constraints += ",~{r7},~{memory}";
         asmText = "svc #0";
+    } else if (current_architecture == Architecture::RISCV32 || current_architecture == Architecture::RISCV64) {
+        static const char* regs[] = {"{x17}", "{x10}", "{x11}", "{x12}", "{x13}", "{x14}", "{x15}"};
+        constraints = "={x10}";
+        for (size_t i = 0; i < operands.size(); ++i) constraints += "," + std::string(regs[i]);
+        constraints += ",~{memory}";
+        asmText = "ecall";
     } else {
         psi::ErrorStream() << "'#syscall' is not implemented for this architecture\n";
         return nullptr;
@@ -789,85 +963,19 @@ llvm::Value* processFloatArithmeticInstruction(
     llvm::Type* f32 = llvm::Type::getFloatTy(*current_context);
     llvm::Type* f64 = llvm::Type::getDoubleTy(*current_context);
 
-    bool isDouble;
-    if (a->getType() == f32 && b->getType() == f32) {
-        isDouble = false;
-    } else if (a->getType() == f64 && b->getType() == f64) {
-        isDouble = true;
-    } else {
+    if (!((a->getType() == f32 && b->getType() == f32)
+        || (a->getType() == f64 && b->getType() == f64))) {
         psi::ErrorStream() << "'#" << op
                            << "' needs two f32 operands or two f64 operands (not mixed)\n";
         return nullptr;
     }
 
-    llvm::Type* operandType = isDouble ? f64 : f32;
-    auto* asmType = llvm::FunctionType::get(operandType, { operandType, operandType }, false);
-
-    std::string constraints;
-    std::string asmText;
-
-    if (current_architecture == Architecture::X86 || current_architecture == Architecture::X86_64) {
-
-        static const std::unordered_map<std::string, std::string> singleMnemonics = {
-            { "fadd", "addss" },
-            { "fsub", "subss" },
-            { "fmul", "mulss" },
-            { "fdiv", "divss" },
-        };
-        static const std::unordered_map<std::string, std::string> doubleMnemonics = {
-            { "fadd", "addsd" },
-            { "fsub", "subsd" },
-            { "fmul", "mulsd" },
-            { "fdiv", "divsd" },
-        };
-        const auto& table = isDouble ? doubleMnemonics : singleMnemonics;
-        auto it = table.find(op);
-        if (it == table.end()) {
-            psi::ErrorStream() << "unsupported floating-point instruction '#" << op << "'\n";
-            return nullptr;
-        }
-        constraints = "=x,0,x";
-        asmText = it->second + " $2, $0";
-
-    } else if (isAArch64(current_architecture)) {
-
-        static const std::unordered_map<std::string, std::string> mnemonics = {
-            { "fadd", "fadd" },
-            { "fsub", "fsub" },
-            { "fmul", "fmul" },
-            { "fdiv", "fdiv" },
-        };
-        auto it = mnemonics.find(op);
-        if (it == mnemonics.end()) {
-            psi::ErrorStream() << "unsupported floating-point instruction '#" << op << "'\n";
-            return nullptr;
-        }
-        constraints = "=w,0,w";
-        asmText = it->second + " $2, $0";
-
-    } else if (isARM32(current_architecture)) {
-
-        static const std::unordered_map<std::string, std::string> mnemonics = {
-            { "fadd", "vadd" },
-            { "fsub", "vsub" },
-            { "fmul", "vmul" },
-            { "fdiv", "vdiv" },
-        };
-        auto it = mnemonics.find(op);
-        if (it == mnemonics.end()) {
-            psi::ErrorStream() << "unsupported floating-point instruction '#" << op << "'\n";
-            return nullptr;
-        }
-        constraints = isDouble ? "=w,0,w" : "=t,0,t";
-        asmText = it->second + (isDouble ? ".f64" : ".f32") + " $2, $0";
-
-    } else {
-        psi::ErrorStream() << "'#" << op << "' is not implemented for this architecture\n";
-        return nullptr;
-    }
-
-    auto* asmFn = llvm::InlineAsm::get(asmType, asmText, constraints, false);
-    return builder->CreateCall(asmFn, { a, b });
+    // LLVM selects the target's scalar FP instruction (or a soft-float helper).
+    // This also avoids tying the language operation to a target's asm operand syntax.
+    if (op == "fadd") return builder->CreateFAdd(a, b);
+    if (op == "fsub") return builder->CreateFSub(a, b);
+    if (op == "fmul") return builder->CreateFMul(a, b);
+    return builder->CreateFDiv(a, b);
 }
 
 static llvm::Value* processUnaryIntegerIntrinsic(
@@ -1171,7 +1279,71 @@ static llvm::Value* processSpecialInstruction(
     llvm::IRBuilder<>* builder,
     const TypeNode* declaredType)
 {
-    const std::string& name = command.instruction.name;
+    std::string name = command.instruction.name;
+    std::replace(name.begin(), name.end(), '.', '_');
+
+    if (name == "memory_size" || name == "memory_grow") {
+        if (!isWasm()) {
+            psi::ErrorStream() << "'#" << name << "' requires WebAssembly\n";
+            return nullptr;
+        }
+        if (command.values.size() != (name == "memory_size" ? 0u : 1u)) {
+            psi::ErrorStream() << "'#" << name << "' has an incorrect operand count\n";
+            return nullptr;
+        }
+        if (name == "memory_size") return wasmMemorySize(builder);
+        auto* amount = processValue(*command.values[0], builder);
+        if (!amount || !amount->getType()->isIntegerTy()) {
+            psi::ErrorStream() << "'#memory_grow' requires an integer page count\n";
+            return nullptr;
+        }
+        auto* word = builder->getIntNTy(current_architecture == Architecture::WASM64 ? 64 : 32);
+        amount = builder->CreateZExtOrTrunc(amount, word);
+        auto* fn = llvm::Intrinsic::getDeclaration(builder->GetInsertBlock()->getModule(),
+            llvm::Intrinsic::wasm_memory_grow, {word});
+        return builder->CreateCall(fn, {builder->getInt32(0), amount});
+    }
+
+    // Fixed, operand-free native instructions. Keeping this allowlist target-specific
+    // prevents accidental use of another architecture's assembly syntax.
+    const bool x86 = current_architecture == Architecture::X86 || current_architecture == Architecture::X86_64;
+    const bool riscv = current_architecture == Architecture::RISCV32 || current_architecture == Architecture::RISCV64;
+    const bool ppc = current_architecture == Architecture::PPC32 || current_architecture == Architecture::PPC64 || current_architecture == Architecture::PPC64LE;
+    const bool mips = current_architecture == Architecture::MIPS || current_architecture == Architecture::MIPSEL || current_architecture == Architecture::MIPS64 || current_architecture == Architecture::MIPS64EL;
+    std::string native;
+    bool memoryBarrier = false;
+    if (name == "nop") {
+        if (isWasm()) {
+            if (!command.values.empty()) psi::ErrorStream() << "'#nop' takes no operands\n";
+            return nullptr;
+        }
+        native = current_architecture == Architecture::SystemZ ? "bcr 0, 0" : "nop";
+    }
+    if (x86 && (name == "lfence" || name == "sfence" || name == "mfence")) { native = name; memoryBarrier = true; }
+    if (isARM(current_architecture)) {
+        if (name == "dmb" || name == "dsb" || name == "isb") { native = name + " sy"; memoryBarrier = true; }
+        if (name == "wfi" || name == "wfe" || name == "sev" || name == "sevl") {
+            if (name != "sevl" || isAArch64(current_architecture)) native = name;
+        }
+    }
+    if (riscv) {
+        if (name == "ecall" || name == "ebreak" || name == "wfi") { native = name; memoryBarrier = true; }
+        if (name == "fence_i") { native = "fence.i"; memoryBarrier = true; }
+    }
+    if (ppc && (name == "sync" || name == "lwsync" || name == "isync" || name == "eieio")) { native = name; memoryBarrier = true; }
+    if (mips && name == "sync") { native = "sync"; memoryBarrier = true; }
+    if (current_architecture == Architecture::LoongArch64 && (name == "dbar" || name == "ibar")) { native = name + " 0"; memoryBarrier = true; }
+    if (current_architecture == Architecture::SystemZ && name == "serialize") { native = "bcr 15, 0"; memoryBarrier = true; }
+    if (!native.empty()) {
+        if (!command.values.empty()) {
+            psi::ErrorStream() << "'#" << name << "' takes no operands\n";
+            return nullptr;
+        }
+        auto* fn = llvm::InlineAsm::get(llvm::FunctionType::get(builder->getVoidTy(), false),
+            native, memoryBarrier ? "~{memory}" : "", true);
+        builder->CreateCall(fn);
+        return nullptr;
+    }
 
     if (name == "syscall")
         return processSyscallInstruction(command, builder);
@@ -1240,6 +1412,10 @@ static llvm::Value* processSpecialInstruction(
     }
 
     if (name == "rdtsc") {
+        if (!command.values.empty()) {
+            psi::ErrorStream() << "'#rdtsc' takes no operands\n";
+            return nullptr;
+        }
         if (current_architecture != Architecture::X86 && current_architecture != Architecture::X86_64) {
             psi::ErrorStream() << "'#rdtsc' is only available on x86 targets\n";
             return nullptr;
@@ -1329,15 +1505,31 @@ llvm::Value* computeCommandValue(CommandNode& command, llvm::IRBuilder<>* builde
         }
         if (op == "load") {
             auto* p = processValue(*command.values[0], builder);
-            return builder->CreateLoad(resolveType(*declaredType), p);
+            auto* type = declaredType ? resolveType(*declaredType) : nullptr;
+            if (!p || !type) return nullptr;
+            if (!p->getType()->isPointerTy()) {
+                psi::logError("'load' requires a pointer operand");
+                return nullptr;
+            }
+            return builder->CreateLoad(type, p);
         }
         if (op == "not") {
             auto* v = processValue(*command.values[0], builder);
-            return v ? builder->CreateNot(v) : nullptr;
+            if (!v) return nullptr;
+            if (!v->getType()->isIntOrIntVectorTy()) {
+                psi::logError("'not' requires an integer operand");
+                return nullptr;
+            }
+            return builder->CreateNot(v);
         }
         if (op == "lnot") {
             auto* v = processValue(*command.values[0], builder);
-            return v ? builder->CreateICmpEQ(v, llvm::Constant::getNullValue(v->getType())) : nullptr;
+            if (!v) return nullptr;
+            if (!v->getType()->isIntegerTy()) {
+                psi::logError("'lnot' requires an integer operand");
+                return nullptr;
+            }
+            return builder->CreateICmpEQ(v, llvm::Constant::getNullValue(v->getType()));
         }
 
         llvm::Value* lhs = (!command.values.empty()) ? processValue(*command.values[0], builder) : nullptr;
@@ -1353,6 +1545,17 @@ llvm::Value* computeCommandValue(CommandNode& command, llvm::IRBuilder<>* builde
         }
 
         bool isFloat = lhs->getType()->isFloatingPointTy();
+
+        const bool integer = lhs->getType()->isIntegerTy();
+        if (!integer && !isFloat) {
+            psi::logError("'" + op + "' requires scalar numeric operands");
+            return nullptr;
+        }
+        if (!integer && (op == "and" || op == "or" || op == "xor" || op == "lsh"
+            || op == "rsh" || op == "land" || op == "lor")) {
+            psi::logError("'" + op + "' requires integer operands");
+            return nullptr;
+        }
 
         if (op == "add")
             return isFloat ? builder->CreateFAdd(lhs, rhs) : builder->CreateAdd(lhs, rhs);
@@ -1465,7 +1668,14 @@ void processCommand(CommandNode command, llvm::IRBuilder<>* builder)
                         builder->CreateRet(retValue);
                     }
                 } else if (command.instruction.name == "store") {
-                    builder->CreateStore(processValue(*command.values[1], builder), processValue(*command.values[0], builder));
+                    auto* pointer = processValue(*command.values[0], builder);
+                    auto* value = processValue(*command.values[1], builder);
+                    if (!pointer || !value) return;
+                    if (!pointer->getType()->isPointerTy() || value->getType()->isVoidTy()) {
+                        psi::logError("'store' requires a pointer and a value");
+                        return;
+                    }
+                    builder->CreateStore(value, pointer);
                 } else if (command.instruction.name == "jmp") {
                     const std::string& target = command.values[0]->registerValue.name;
                     auto it = labels.find(target);
@@ -1616,6 +1826,13 @@ void generateFunctionBody(const BlockNode& body, llvm::Function* function,
     predeclareLabels(body.commands, function);
 
     for (auto command : body.commands) {
+        if (psi::hadErrors()) break;
+        const bool isLabel = command.hasInstruction && !command.instruction.isSpecial
+            && command.instruction.name == "label";
+        if (builder.GetInsertBlock()->getTerminator() && !isLabel) {
+            if (!command.isEmpty) psi::logError("instruction after a terminator requires a label");
+            continue;
+        }
         processCommand(command, &builder);
     }
 
@@ -1641,6 +1858,37 @@ void generateFunctionBody(const BlockNode& body, llvm::Function* function,
 
 std::string defaultTriple(Architecture arch, OperatingSystem os)
 {
+    const bool wasm = arch == Architecture::WASM32 || arch == Architecture::WASM64;
+    if (wasm) {
+        if (os != OperatingSystem::FreeStanding && os != OperatingSystem::WASI)
+            throw std::runtime_error("WebAssembly requires OS none or wasi");
+        return std::string(arch == Architecture::WASM32 ? "wasm32" : "wasm64")
+            + (os == OperatingSystem::WASI ? "-unknown-wasi" : "-unknown-unknown");
+    }
+    if (os == OperatingSystem::WASI)
+        throw std::runtime_error("WASI requires WebAssembly");
+    std::string cpu;
+    switch (arch) {
+    case Architecture::RISCV32: cpu = "riscv32"; break;
+    case Architecture::RISCV64: cpu = "riscv64"; break;
+    case Architecture::PPC32: cpu = "powerpc"; break;
+    case Architecture::PPC64: cpu = "powerpc64"; break;
+    case Architecture::PPC64LE: cpu = "powerpc64le"; break;
+    case Architecture::MIPS: cpu = "mips"; break;
+    case Architecture::MIPSEL: cpu = "mipsel"; break;
+    case Architecture::MIPS64: cpu = "mips64"; break;
+    case Architecture::MIPS64EL: cpu = "mips64el"; break;
+    case Architecture::LoongArch64: cpu = "loongarch64"; break;
+    case Architecture::SystemZ: cpu = "s390x"; break;
+    default: break;
+    }
+    if (!cpu.empty()) {
+        if (os != OperatingSystem::Linux && os != OperatingSystem::FreeStanding)
+            throw std::runtime_error("this architecture supports Linux or freestanding targets");
+        const bool mips64 = arch == Architecture::MIPS64 || arch == Architecture::MIPS64EL;
+        return cpu + (os == OperatingSystem::Linux
+            ? (mips64 ? "-unknown-linux-gnuabi64" : "-unknown-linux-gnu") : "-unknown-none");
+    }
     switch (os) {
     case OperatingSystem::Linux:
         switch (arch) {
@@ -1652,6 +1900,7 @@ std::string defaultTriple(Architecture arch, OperatingSystem os)
             return "aarch64-unknown-linux-gnu";
         case Architecture::ARM:
             return "armv7-unknown-linux-gnueabihf";
+        default: break;
         }
         break;
     case OperatingSystem::Darwin:
@@ -1664,6 +1913,7 @@ std::string defaultTriple(Architecture arch, OperatingSystem os)
             return "arm64-apple-macosx";
         case Architecture::ARM:
             return "armv7-apple-ios";
+        default: break;
         }
         break;
     case OperatingSystem::Windows:
@@ -1676,6 +1926,7 @@ std::string defaultTriple(Architecture arch, OperatingSystem os)
             return "aarch64-pc-windows-msvc";
         case Architecture::ARM:
             return "thumbv7-pc-windows-msvc";
+        default: break;
         }
         break;
     case OperatingSystem::FreeStanding:
@@ -1688,24 +1939,37 @@ std::string defaultTriple(Architecture arch, OperatingSystem os)
             return "aarch64-unknown-none";
         case Architecture::ARM:
             return "armv7-unknown-none-eabihf";
+        default: break;
         }
         break;
+    default: break;
     }
-    return "x86_64-unknown-linux-gnu";
+    throw std::runtime_error("unsupported architecture/OS combination");
 }
 
-std::string compileProgram(std::string name, ProgramNode program, Architecture arch, OperatingSystem os)
+std::unique_ptr<llvm::TargetMachine> buildTargetMachine(const std::string&, std::string&);
+
+std::string compileProgram(std::string name, ProgramNode program, Architecture arch, OperatingSystem os, const std::string& targetTriple)
 {
     psi::resetErrors();
 
     llvm::LLVMContext context;
+    context.setDiagnosticHandlerCallBack(captureLLVMDiagnostic, nullptr, true);
     current_context = &context;
     current_architecture = arch;
     current_os = os;
     buildSpecialRegisterTable(arch);
 
     llvm::Module module(name, context);
-    module.setTargetTriple(defaultTriple(arch, os));
+    const std::string defaultTarget = defaultTriple(arch, os);
+    module.setTargetTriple(targetTriple.empty() ? defaultTarget : targetTriple);
+    llvm::InitializeAllTargetInfos();
+    llvm::InitializeAllTargets();
+    llvm::InitializeAllTargetMCs();
+    std::string targetError;
+    auto targetMachine = buildTargetMachine(module.getTargetTriple(), targetError);
+    if (!targetMachine) throw std::runtime_error(targetError);
+    module.setDataLayout(targetMachine->createDataLayout());
 
     types.clear();
     types["void"] = llvm::Type::getVoidTy(context);
@@ -1857,6 +2121,12 @@ std::string compileProgram(std::string name, ProgramNode program, Architecture a
         }
     }
 
+    // Preserve baseline ISA requirements when users pass emitted IR to LLVM tools.
+    for (auto& function : module) {
+        if (!function.isDeclaration() && !targetMachine->getTargetFeatureString().empty())
+            function.addFnAttr("target-features", targetMachine->getTargetFeatureString());
+    }
+
     std::string moduleErrStr;
     llvm::raw_string_ostream moduleErrStream(moduleErrStr);
     if (llvm::verifyModule(module, &moduleErrStream)) {
@@ -1883,8 +2153,14 @@ std::unique_ptr<llvm::TargetMachine> buildTargetMachine(const std::string& tripl
 
     llvm::TargetOptions options;
     auto relocModel = llvm::Reloc::PIC_;
+    std::string features;
+    const llvm::Triple parsedTriple(triple);
+    if (parsedTriple.getArch() == llvm::Triple::x86) features = "+sse2";
+    if (parsedTriple.getArch() == llvm::Triple::arm || parsedTriple.getArch() == llvm::Triple::thumb)
+        features = "+vfp3";
+    if (parsedTriple.getArch() == llvm::Triple::loongarch64) features = "+f,+d";
     std::unique_ptr<llvm::TargetMachine> targetMachine(
-        target->createTargetMachine(triple, "generic", "", options, relocModel));
+        target->createTargetMachine(triple, "generic", features, options, relocModel));
 
     if (!targetMachine) {
         errorMessage = "failed to create a target machine for '" + triple + "'";
@@ -1945,6 +2221,7 @@ std::string optimizeIR(const std::string& irCode, OptLevel level, std::string& e
     llvm::InitializeAllAsmPrinters();
 
     llvm::LLVMContext context;
+    context.setDiagnosticHandlerCallBack(captureLLVMDiagnostic, nullptr, true);
     llvm::SMDiagnostic diagnostic;
 
     std::unique_ptr<llvm::MemoryBuffer> irBuffer = llvm::MemoryBuffer::getMemBuffer(irCode, "module");
@@ -1982,10 +2259,10 @@ std::string optimizeIR(const std::string& irCode, OptLevel level, std::string& e
     return output;
 }
 
-bool compileToObjectFile(
+bool compileToObjectMemory(
     const std::string& irCode,
     const std::string& targetTriple,
-    const std::string& outputPath,
+    std::vector<std::uint8_t>& output,
     OptLevel level,
     std::string& errorMessage)
 {
@@ -1997,6 +2274,7 @@ bool compileToObjectFile(
     llvm::InitializeAllAsmPrinters();
 
     llvm::LLVMContext context;
+    context.setDiagnosticHandlerCallBack(captureLLVMDiagnostic, nullptr, true);
     llvm::SMDiagnostic diagnostic;
 
     std::unique_ptr<llvm::MemoryBuffer> irBuffer = llvm::MemoryBuffer::getMemBuffer(irCode, "module");
@@ -2029,12 +2307,9 @@ bool compileToObjectFile(
 
     runOptimizationPipeline(*module, targetMachine.get(), level);
 
-    std::error_code fileError;
-    llvm::raw_fd_ostream outputStream(outputPath, fileError, llvm::sys::fs::OF_None);
-    if (fileError) {
-        errorMessage = "failed to open output file '" + outputPath + "': " + fileError.message();
-        return false;
-    }
+    output.clear();
+    llvm::SmallVector<char, 0> buffer;
+    llvm::raw_svector_ostream outputStream(buffer);
 
     llvm::legacy::PassManager passManager;
     if (targetMachine->addPassesToEmitFile(passManager, outputStream, nullptr, llvm::CodeGenFileType::ObjectFile)) {
@@ -2043,12 +2318,7 @@ bool compileToObjectFile(
     }
 
     passManager.run(*module);
-    outputStream.flush();
-
-    if (outputStream.has_error()) {
-        errorMessage = "error writing '" + outputPath + "': " + outputStream.error().message();
-        return false;
-    }
-
+    if (psi::hadErrors()) return false;
+    output.assign(buffer.begin(), buffer.end());
     return true;
 }

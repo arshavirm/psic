@@ -15,6 +15,8 @@ public:
 private:
     std::vector<Token> tokens;
     int position = 0;
+    std::vector<std::shared_ptr<ValueNode>> ownedValues;
+    ValueNode* makeValue();
 
     Token currentToken();
     Token lookAheadToken(int howManyAhead);

@@ -325,7 +325,7 @@ ValueNode* Parser::parseValue()
 
     if (token.type == TokenType::Number) {
         consumeToken();
-        ValueNode* value = new ValueNode();
+        ValueNode* value = makeValue();
         value->kind = ValueKind::Number;
 
         size_t hexPrefixPos = (!token.text.empty() && token.text[0] == '-') ? 1 : 0;
@@ -346,7 +346,7 @@ ValueNode* Parser::parseValue()
 
     if (token.type == TokenType::String) {
         consumeToken();
-        ValueNode* value = new ValueNode();
+        ValueNode* value = makeValue();
         value->kind = ValueKind::String;
         value->stringValue = decodeStringEscapes(token.text);
         return value;
@@ -354,7 +354,7 @@ ValueNode* Parser::parseValue()
 
     if (token.type == TokenType::SpecialRegister) {
         consumeToken();
-        ValueNode* value = new ValueNode();
+        ValueNode* value = makeValue();
         value->kind = ValueKind::SpecialRegister;
         value->specialRegisterValue.name = token.text.substr(1);
         return value;
@@ -362,7 +362,7 @@ ValueNode* Parser::parseValue()
 
     if (token.type == TokenType::LeftBracket) {
         consumeToken();
-        ValueNode* value = new ValueNode();
+        ValueNode* value = makeValue();
         value->kind = ValueKind::Array;
         while (!checkTokenType(TokenType::RightBracket)) {
             value->arrayValues.push_back(parseValue());
@@ -375,7 +375,7 @@ ValueNode* Parser::parseValue()
 
         if (token.text == "true" || token.text == "false") {
             consumeToken();
-            ValueNode* value = new ValueNode();
+            ValueNode* value = makeValue();
             value->kind = ValueKind::Bool;
             value->boolValue = (token.text == "true");
             return value;
@@ -383,12 +383,12 @@ ValueNode* Parser::parseValue()
 
         if (token.text == "null" || token.text == "nullptr") {
             consumeToken();
-            ValueNode* value = new ValueNode();
+            ValueNode* value = makeValue();
             value->kind = ValueKind::Null;
             return value;
         }
 
-        ValueNode* value = new ValueNode();
+        ValueNode* value = makeValue();
         value->kind = ValueKind::Register;
         value->registerValue = parseRegister();
         return value;
@@ -588,11 +588,18 @@ DeclarationNode Parser::parseDeclaration()
     return decl;
 }
 
+ValueNode* Parser::makeValue()
+{
+    ownedValues.push_back(std::make_shared<ValueNode>());
+    return ownedValues.back().get();
+}
+
 ProgramNode Parser::parseProgram()
 {
     ProgramNode program;
     while (!checkTokenType(TokenType::EndOfFile)) {
         program.declarations.push_back(parseDeclaration());
     }
+    program.ownedValues = std::move(ownedValues);
     return program;
 }

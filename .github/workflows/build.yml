@@ -80,20 +80,35 @@ jobs:
       - name: Build
         run: cmake --build build-ci --config RelWithDebInfo --parallel
 
+      - name: Test compiler and library
+        run: ctest --test-dir build-ci -C RelWithDebInfo --output-on-failure
+
+      - name: Build and test shared library (Linux x86_64)
+        if: matrix.name == 'Linux x86_64'
+        run: |
+          cmake -S . -B build-shared -G Ninja -DCMAKE_BUILD_TYPE=Debug -DBUILD_SHARED_LIBS=ON -DLLVM_DIR="${LLVM_DIR}"
+          cmake --build build-shared --parallel 2
+          ctest --test-dir build-shared --output-on-failure
+
+      - name: Check library with sanitizers (Linux x86_64)
+        if: matrix.name == 'Linux x86_64'
+        run: |
+          cmake -S . -B build-sanitize -G Ninja -DCMAKE_BUILD_TYPE=Debug -DPSIC_SANITIZE=ON -DPSIC_BUILD_CLI=OFF -DLLVM_DIR="${LLVM_DIR}"
+          cmake --build build-sanitize --parallel 2
+          ctest --test-dir build-sanitize --output-on-failure
+
       - name: Package (Unix)
         if: runner.os != 'Windows'
         run: |
-          mkdir -p package
-          cp build-ci/psic package/
-          tar -C package -czf "${{ matrix.artifact }}.tar.gz" psic
+          cmake --install build-ci --prefix package --config RelWithDebInfo
+          tar -C package -czf "${{ matrix.artifact }}.tar.gz" .
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force package | Out-Null
-          Copy-Item build-ci/RelWithDebInfo/psic.exe package/
-          Compress-Archive -Path package/psic.exe -DestinationPath "${{ matrix.artifact }}.zip"
+          cmake --install build-ci --prefix package --config RelWithDebInfo
+          Compress-Archive -Path package/* -DestinationPath "${{ matrix.artifact }}.zip"
 
       - name: Upload compiler artifact
         uses: actions/upload-artifact@v4

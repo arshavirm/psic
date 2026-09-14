@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <memory>
 #include <vector>
 
 struct TypeNode {
@@ -144,4 +145,6 @@ struct DeclarationNode {
 
 struct ProgramNode {
     std::vector<DeclarationNode> declarations;
+    // Keep parsed values alive across AST copies without recursive ownership.
+    std::vector<std::shared_ptr<ValueNode>> ownedValues;
 };

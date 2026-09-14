@@ -86,16 +86,20 @@ void Lexer::skipWhitespaceAndComments()
         }
 
         if (c == '/' && lookAheadChar() == '*') {
+            const int startLine = line;
+            bool closed = false;
             readChar();
             readChar();
             while (!isAtEnd()) {
                 if (currentChar() == '*' && lookAheadChar() == '/') {
                     readChar();
                     readChar();
+                    closed = true;
                     break;
                 }
                 readChar();
             }
+            if (!closed) throw std::runtime_error("unterminated block comment at line " + std::to_string(startLine));
             continue;
         }
 
@@ -136,6 +140,8 @@ Token Lexer::readNumber()
     if (isHex) {
         text = text + readChar();
         text = text + readChar();
+        if (!isHexDigitChar(currentChar()))
+            throw std::runtime_error("expected hexadecimal digits at line " + std::to_string(startLine));
         while (!isAtEnd() && isHexDigitChar(currentChar())) {
             text = text + readChar();
         }
@@ -207,8 +213,14 @@ Token Lexer::readSpecialToken(char marker, TokenType type)
     if (!isLetterChar(currentChar())) {
         throw std::runtime_error(std::string("expected a name right after '") + marker + "' at line " + std::to_string(startLine));
     }
-    while (!isAtEnd() && isLetterOrDigitChar(currentChar())) {
-        text = text + readChar();
+    while (!isAtEnd()) {
+        if (isLetterOrDigitChar(currentChar())) {
+            text += readChar();
+        } else if (marker == '#' && currentChar() == '.' && isLetterChar(lookAheadChar())) {
+            text += readChar();
+        } else {
+            break;
+        }
     }
 
     Token token;

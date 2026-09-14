@@ -1,0 +1,8 @@
+@PACKAGE_INIT@
+include(CMakeFindDependencyMacro)
+if(NOT @BUILD_SHARED_LIBS@)
+    find_dependency(LLVM @LLVM_PACKAGE_VERSION@ CONFIG)
+    find_dependency(Threads)
+endif()
+include("${CMAKE_CURRENT_LIST_DIR}/PSICTargets.cmake")
+check_required_components(PSIC)

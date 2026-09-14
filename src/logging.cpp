@@ -5,9 +5,17 @@
 namespace psi {
 
 namespace {
-    bool verboseEnabled = false;
-    int errors = 0;
-    int warnings = 0;
+    thread_local bool verboseEnabled = false;
+    thread_local int errors = 0;
+    thread_local int warnings = 0;
+    thread_local std::vector<psic::Diagnostic>* diagnosticSink = nullptr;
+}
+
+std::vector<psic::Diagnostic>* setDiagnosticSink(std::vector<psic::Diagnostic>* sink)
+{
+    auto* previous = diagnosticSink;
+    diagnosticSink = sink;
+    return previous;
 }
 
 void setVerbose(bool enabled)
@@ -18,23 +26,35 @@ void setVerbose(bool enabled)
 void logError(const std::string& message)
 {
     errors++;
+    if (diagnosticSink) {
+        diagnosticSink->push_back({psic::DiagnosticSeverity::Error, message});
+        return;
+    }
     std::cerr << "psic: error: " << message << "\n";
 }
 
 void logWarning(const std::string& message)
 {
     warnings++;
+    if (diagnosticSink) {
+        diagnosticSink->push_back({psic::DiagnosticSeverity::Warning, message});
+        return;
+    }
     std::cerr << "psic: warning: " << message << "\n";
 }
 
 void logNote(const std::string& message)
 {
+    if (diagnosticSink) {
+        diagnosticSink->push_back({psic::DiagnosticSeverity::Note, message});
+        return;
+    }
     std::cerr << "psic: note: " << message << "\n";
 }
 
 void logInfo(const std::string& message)
 {
-    if (verboseEnabled) {
+    if (verboseEnabled && !diagnosticSink) {
         std::cerr << "psic: " << message << "\n";
     }
 }
@@ -70,7 +90,7 @@ InfoStream::~InfoStream()
     if (!message.empty() && message.back() == '\n') {
         message.pop_back();
     }
-    if (verboseEnabled && !message.empty()) {
+    if (verboseEnabled && !diagnosticSink && !message.empty()) {
         std::cerr << "psic: " << message << "\n";
     }
 }
