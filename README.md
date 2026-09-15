@@ -98,7 +98,8 @@ CTest covers:
   and calls into host C++ code.
 - CLI arguments, stdin/stdout, output paths, diagnostic locations, and preservation
   of existing output files after compiler errors.
-- A separate CMake consumer that links and runs using only a relocated installation.
+- Separate CMake consumers that link and run using a relocated installation and
+  `add_subdirectory`, with library-only embedding.
 
 The compiler validates operand counts, label/name requirements, result targets,
 void types, alignment, duplicate symbols/fields/arguments/labels, and by-value

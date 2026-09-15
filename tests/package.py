@@ -38,4 +38,14 @@ with tempfile.TemporaryDirectory(prefix='psic package ') as directory:
     env = os.environ.copy()
     env['PATH'] = str(moved / 'bin') + os.pathsep + env.get('PATH', '')
     run([args.ctest, '--test-dir', str(client), '-C', args.config, '--output-on-failure'], env)
-print('Installed PSIC::psic consumer built and ran after relocation.')
+    embedded = root / 'embedded build'
+    embed_command = [args.cmake, '-S', args.source, '-B', str(embedded), '-G', args.generator,
+                     f'-DPSIC_SOURCE_DIR={Path(args.source).resolve().parents[1]}',
+                     f'-DLLVM_DIR={args.llvm}', f'-DCMAKE_CXX_COMPILER={args.compiler}',
+                     f'-DCMAKE_BUILD_TYPE={args.config}']
+    if args.platform:
+        embed_command += ['-A', args.platform]
+    run(embed_command)
+    run([args.cmake, '--build', str(embedded), '--config', args.config, '--parallel', '2'])
+    run([args.ctest, '--test-dir', str(embedded), '-C', args.config, '--output-on-failure'])
+print('Relocated installed and add_subdirectory consumers built and ran.')

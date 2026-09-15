@@ -1,0 +1,45 @@
+i32 shared_value = 11;
+struct Pair { i32 left i32 right }
+func i32 host_increment i32 value;
+func i32 psi_add i32 a i32 b { i32 result = add a b; ret result; }
+func u32 psi_unsigned_shift u32 value { u32 result = rsh value 1; ret result; }
+func i32 psi_signed_shift i32 value { i32 result = rsh value 1; ret result; }
+func i32 psi_sum i32 n {
+    i32 total = 0;
+    i32 index = 0;
+    label loop;
+    bool more = lt index n;
+    cjmp more body;
+    ret total;
+    label body;
+    total = add total index;
+    index = add index 1;
+    jmp loop;
+}
+func i32 psi_array {
+    i32* items = [3 5 7];
+    i32 result = add items[0] items[2];
+    ret result;
+}
+func i32 psi_struct {
+    Pair pair;
+    pair.left = 4;
+    pair.right = 8;
+    i32 result = add pair.left pair.right;
+    ret result;
+}
+func i32 psi_memory {
+    i32 value = 7;
+    i32* pointer = ref value;
+    store pointer 19;
+    i32 result = load pointer;
+    ret result;
+}
+func i32 psi_external i32 value { i32 result = call host_increment value; ret result; }
+func i32 psi_global { ret shared_value; }
+func f64 psi_float f64 value {
+    f64 factor = 2.0;
+    f64 result = #fmul value factor;
+    ret result;
+}
+func i32 psi_popcount i32 value { i32 result = #popcnt value; ret result; }

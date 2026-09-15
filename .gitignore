@@ -70,3 +70,6 @@ Testing/
 
 # PSI files
 *.psi
+# Keep compiler regression fixtures in version control
+!tests/**/*.psi
+!tests/*.psi
