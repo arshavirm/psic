@@ -37,6 +37,15 @@ with tempfile.TemporaryDirectory(prefix='psic package ') as directory:
     run([args.cmake, '--build', str(client), '--config', args.config, '--parallel', '2'])
     env = os.environ.copy()
     env['PATH'] = str(moved / 'bin') + os.pathsep + env.get('PATH', '')
+    # Exercise the installed CLI too: shared builds must locate libpsic after moving.
+    for executable in moved.rglob('psic.exe' if os.name == 'nt' else 'psic'):
+        if executable.is_file():
+            source = root / 'answer.psi'
+            source.write_text('func i32 answer { ret 42; }')
+            output = root / 'answer.ll'
+            run([str(executable), str(source), '--emit-llvm', '-o', str(output)], env)
+            if 'ret i32 42' not in output.read_text():
+                raise RuntimeError('installed CLI produced incorrect IR')
     run([args.ctest, '--test-dir', str(client), '-C', args.config, '--output-on-failure'], env)
     embedded = root / 'embedded build'
     embed_command = [args.cmake, '-S', args.source, '-B', str(embedded), '-G', args.generator,

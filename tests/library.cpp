@@ -3,7 +3,6 @@
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
-#include <fstream>
 
 static void check(bool condition, const std::string& message)
 {
@@ -45,6 +44,10 @@ int main()
             check(result.success, diagnostics(result));
             if (level != psic::OptimizationLevel::O0)
                 check(result.ir.find("ret i32 42") != std::string::npos, "optimization did not fold arithmetic");
+            options.output = psic::OutputKind::Object;
+            auto object = psic::compile("func i32 answer { i32 n = add 20 22; ret n; }", options);
+            check(object.success && !object.object.empty() && object.ir.empty(), diagnostics(object));
+            options.output = psic::OutputKind::LLVMIR;
         }
         options.architecture = "wasm32";
         options.output = psic::OutputKind::Object;
