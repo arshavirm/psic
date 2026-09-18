@@ -3,16 +3,15 @@
 #include <llvm/Analysis/CGSCCPassManager.h>
 #include <llvm/Config/llvm-config.h>
 #include <llvm/IR/Constants.h>
+#include <llvm/IR/DerivedTypes.h>
 #include <llvm/IR/DiagnosticInfo.h>
 #include <llvm/IR/DiagnosticPrinter.h>
-#include <llvm/IR/DerivedTypes.h>
 #include <llvm/IR/GlobalVariable.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/InlineAsm.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/IntrinsicsWebAssembly.h>
 #include <llvm/IR/IntrinsicsX86.h>
-#include <algorithm>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/Module.h>
@@ -31,7 +30,12 @@
 #include <llvm/Target/TargetMachine.h>
 #include <llvm/Target/TargetOptions.h>
 #include <llvm/TargetParser/Host.h>
+
+#include <algorithm>
+#include <string>
 #include <unordered_map>
+
+namespace {
 
 #if LLVM_VERSION_MAJOR >= 19
 static void captureLLVMDiagnostic(const llvm::DiagnosticInfo* diagnostic, void*)
@@ -53,23 +57,23 @@ static void captureLLVMDiagnostic(const llvm::DiagnosticInfo& diagnostic, void*)
     else if (info.getSeverity() == llvm::DS_Note) psi::logNote(message);
 }
 
-std::unordered_map<std::string, llvm::Type*> types;
+std::unordered_map<std::string, llvm::Type*> llvmTypes;
 
-std::unordered_map<std::string, llvm::FunctionType*> functions;
-std::unordered_map<std::string, llvm::Function*> function_values;
-std::unordered_map<std::string, std::vector<TypeNode>> function_param_declared_types;
-std::unordered_map<std::string, TypeNode> function_return_declared_types;
+std::unordered_map<std::string, llvm::FunctionType*> functionTypes;
+std::unordered_map<std::string, llvm::Function*> functionDeclarations;
+std::unordered_map<std::string, std::vector<TypeNode>> functionParamTypes;
+std::unordered_map<std::string, TypeNode> functionReturnTypes;
 
 std::unordered_map<std::string, llvm::GlobalVariable*> globals;
-std::unordered_map<std::string, TypeNode> global_declared_types;
+std::unordered_map<std::string, TypeNode> globalTypes;
 
-std::unordered_map<std::string, std::unordered_map<std::string, int>> struct_field_index;
-std::unordered_map<std::string, std::vector<TypeNode>> struct_field_types;
+std::unordered_map<std::string, std::unordered_map<std::string, int>> structFieldIndex;
+std::unordered_map<std::string, std::vector<TypeNode>> structFieldTypes;
 
-std::unordered_map<std::string, llvm::Value*> values;
-std::unordered_map<std::string, TypeNode> value_declared_types;
+std::unordered_map<std::string, llvm::Value*> locals;
+std::unordered_map<std::string, TypeNode> localTypes;
 std::unordered_map<std::string, llvm::BasicBlock*> labels;
-std::vector<std::string> used_values;
+std::vector<std::string> declaredLocalNames;
 
 llvm::LLVMContext* current_context;
 llvm::Function* current_function = nullptr;
@@ -79,8 +83,8 @@ OperatingSystem current_os = OperatingSystem::Linux;
 
 llvm::Type* resolveType(const TypeNode& type)
 {
-    auto it = types.find(type.baseName);
-    if (it == types.end()) {
+    auto it = llvmTypes.find(type.baseName);
+    if (it == llvmTypes.end()) {
         psi::ErrorStream() << "unknown type '" << type.baseName << "'\n";
         return nullptr;
     }
@@ -196,7 +200,7 @@ struct SpecialRegisterInfo {
     std::string writeAsm;
 };
 
-std::unordered_map<std::string, SpecialRegisterInfo> special_registers;
+std::unordered_map<std::string, SpecialRegisterInfo> specialRegisters;
 
 llvm::Type* widthToType(RegisterWidth width, llvm::LLVMContext& context)
 {
@@ -219,7 +223,7 @@ llvm::Type* widthToType(RegisterWidth width, llvm::LLVMContext& context)
 
 void addRegister(const std::string& name, RegisterWidth width)
 {
-    special_registers[name] = SpecialRegisterInfo { "{" + name + "}", width, "", "" };
+    specialRegisters[name] = SpecialRegisterInfo { "{" + name + "}", width, "", "" };
 }
 
 static bool isAArch64(Architecture arch)
@@ -239,7 +243,7 @@ static bool isARM(Architecture arch)
 
 void buildSpecialRegisterTable(Architecture arch)
 {
-    special_registers.clear();
+    specialRegisters.clear();
 
     if (arch == Architecture::X86_64) {
         static const char* gpr64[] = {
@@ -328,16 +332,16 @@ void buildSpecialRegisterTable(Architecture arch)
         for (int i = 0; i < 32; ++i) {
             std::string name = "x" + std::to_string(i);
             addRegister(name, width);
-            special_registers[aliases[i]] = special_registers[name];
+            specialRegisters[aliases[i]] = specialRegisters[name];
         }
-        special_registers["fp"] = special_registers["x8"];
+        specialRegisters["fp"] = specialRegisters["x8"];
     }
     if (arch == Architecture::PPC32 || arch == Architecture::PPC64 || arch == Architecture::PPC64LE) {
         for (int i = 0; i < 32; ++i) {
             addRegister("r" + std::to_string(i), arch == Architecture::PPC32 ? RegisterWidth::I32 : RegisterWidth::I64);
             addRegister("f" + std::to_string(i), RegisterWidth::F64);
         }
-        special_registers["sp"] = special_registers["r1"];
+        specialRegisters["sp"] = specialRegisters["r1"];
     }
     if (arch == Architecture::MIPS || arch == Architecture::MIPSEL
         || arch == Architecture::MIPS64 || arch == Architecture::MIPS64EL) {
@@ -347,34 +351,34 @@ void buildSpecialRegisterTable(Architecture arch)
             "s4", "s5", "s6", "s7", "t8", "t9", "k0", "k1", "gp", "sp", "fp", "ra"};
         for (int i = 0; i < 32; ++i) {
             std::string name = "r" + std::to_string(i);
-            special_registers[name] = {"{$" + std::to_string(i) + "}", wide ? RegisterWidth::I64 : RegisterWidth::I32, "", ""};
-            if (!wide || i < 8 || i >= 16) special_registers[aliases[i]] = special_registers[name];
+            specialRegisters[name] = {"{$" + std::to_string(i) + "}", wide ? RegisterWidth::I64 : RegisterWidth::I32, "", ""};
+            if (!wide || i < 8 || i >= 16) specialRegisters[aliases[i]] = specialRegisters[name];
         }
         if (wide) {
-            for (int i = 4; i < 8; ++i) special_registers["a" + std::to_string(i)] = special_registers["r" + std::to_string(i + 4)];
-            for (int i = 0; i < 4; ++i) special_registers["t" + std::to_string(i)] = special_registers["r" + std::to_string(i + 12)];
+            for (int i = 4; i < 8; ++i) specialRegisters["a" + std::to_string(i)] = specialRegisters["r" + std::to_string(i + 4)];
+            for (int i = 0; i < 4; ++i) specialRegisters["t" + std::to_string(i)] = specialRegisters["r" + std::to_string(i + 12)];
         }
     }
     if (arch == Architecture::LoongArch64) {
         for (int i = 0; i < 32; ++i) addRegister("r" + std::to_string(i), RegisterWidth::I64);
-        special_registers["zero"] = special_registers["r0"];
-        special_registers["ra"] = special_registers["r1"];
-        special_registers["tp"] = special_registers["r2"];
-        special_registers["sp"] = special_registers["r3"];
-        special_registers["fp"] = special_registers["r22"];
-        for (int i = 0; i < 8; ++i) special_registers["a" + std::to_string(i)] = special_registers["r" + std::to_string(i + 4)];
+        specialRegisters["zero"] = specialRegisters["r0"];
+        specialRegisters["ra"] = specialRegisters["r1"];
+        specialRegisters["tp"] = specialRegisters["r2"];
+        specialRegisters["sp"] = specialRegisters["r3"];
+        specialRegisters["fp"] = specialRegisters["r22"];
+        for (int i = 0; i < 8; ++i) specialRegisters["a" + std::to_string(i)] = specialRegisters["r" + std::to_string(i + 4)];
     }
     if (arch == Architecture::SystemZ) {
         for (int i = 0; i < 16; ++i) {
             addRegister("r" + std::to_string(i), RegisterWidth::I64);
             addRegister("f" + std::to_string(i), RegisterWidth::F64);
         }
-        special_registers["sp"] = special_registers["r15"];
+        specialRegisters["sp"] = specialRegisters["r15"];
     }
 
     auto systemRegister = [&](const std::string& name, RegisterWidth width,
                               const std::string& read, const std::string& write = "") {
-        special_registers[name] = {"r", width, read, write};
+        specialRegisters[name] = {"r", width, read, write};
     };
     if (isAArch64(arch)) {
         systemRegister("nzcv", RegisterWidth::I64, "mrs $0, NZCV", "msr NZCV, $0");
@@ -385,8 +389,8 @@ void buildSpecialRegisterTable(Architecture arch)
         systemRegister("tpidr_el0", RegisterWidth::I64, "mrs $0, TPIDR_EL0", "msr TPIDR_EL0, $0");
     }
     if (isARM32(arch)) {
-        special_registers["r13"] = special_registers["sp"];
-        special_registers["r14"] = special_registers["lr"];
+        specialRegisters["r13"] = specialRegisters["sp"];
+        specialRegisters["r14"] = specialRegisters["lr"];
         systemRegister("apsr", RegisterWidth::I32, "mrs $0, APSR", "msr APSR_nzcvq, $0");
     }
     if (arch == Architecture::RISCV32 || arch == Architecture::RISCV64) {
@@ -427,15 +431,15 @@ RegisterAddress resolveRegisterAddress(const RegNode& reg, llvm::IRBuilder<>* bu
     llvm::Value* address = nullptr;
     TypeNode currentType;
 
-    auto localIt = values.find(reg.name);
-    if (localIt != values.end()) {
+    auto localIt = locals.find(reg.name);
+    if (localIt != locals.end()) {
         address = localIt->second;
-        currentType = value_declared_types[reg.name];
+        currentType = localTypes[reg.name];
     } else {
         auto globIt = globals.find(reg.name);
         if (globIt != globals.end()) {
             address = globIt->second;
-            currentType = global_declared_types[reg.name];
+            currentType = globalTypes[reg.name];
         } else {
             psi::ErrorStream() << "use of undeclared register '" << reg.name << "'\n";
             return result;
@@ -449,8 +453,8 @@ RegisterAddress resolveRegisterAddress(const RegNode& reg, llvm::IRBuilder<>* bu
                                    << "' needs a struct value, not a pointer (use '[ ]' to index through a pointer first)\n";
                 return { };
             }
-            auto structIt = struct_field_index.find(currentType.baseName);
-            if (structIt == struct_field_index.end()) {
+            auto structIt = structFieldIndex.find(currentType.baseName);
+            if (structIt == structFieldIndex.end()) {
                 psi::ErrorStream() << "'" << currentType.baseName << "' is not a struct type\n";
                 return { };
             }
@@ -466,7 +470,7 @@ RegisterAddress resolveRegisterAddress(const RegNode& reg, llvm::IRBuilder<>* bu
                 return { };
             }
             address = builder->CreateStructGEP(structLlvmType, address, (unsigned)fieldIt->second);
-            currentType = struct_field_types[currentType.baseName][fieldIt->second];
+            currentType = structFieldTypes[currentType.baseName][fieldIt->second];
         } else {
             if (currentType.pointerLevel < 1) {
                 psi::ErrorStream() << "'[ ]' index on '" << reg.name
@@ -506,12 +510,12 @@ bool resolveRegisterTypeNode(const RegNode& reg, TypeNode& outType)
 {
     TypeNode currentType;
 
-    auto localIt = value_declared_types.find(reg.name);
-    if (localIt != value_declared_types.end()) {
+    auto localIt = localTypes.find(reg.name);
+    if (localIt != localTypes.end()) {
         currentType = localIt->second;
     } else {
-        auto globIt = global_declared_types.find(reg.name);
-        if (globIt != global_declared_types.end()) {
+        auto globIt = globalTypes.find(reg.name);
+        if (globIt != globalTypes.end()) {
             currentType = globIt->second;
         } else {
             return false;
@@ -523,15 +527,15 @@ bool resolveRegisterTypeNode(const RegNode& reg, TypeNode& outType)
             if (currentType.pointerLevel != 0) {
                 return false;
             }
-            auto structIt = struct_field_index.find(currentType.baseName);
-            if (structIt == struct_field_index.end()) {
+            auto structIt = structFieldIndex.find(currentType.baseName);
+            if (structIt == structFieldIndex.end()) {
                 return false;
             }
             auto fieldIt = structIt->second.find(accessor.fieldName);
             if (fieldIt == structIt->second.end()) {
                 return false;
             }
-            currentType = struct_field_types[currentType.baseName][fieldIt->second];
+            currentType = structFieldTypes[currentType.baseName][fieldIt->second];
         } else {
             if (currentType.pointerLevel < 1) {
                 return false;
@@ -578,8 +582,8 @@ llvm::Value* processSpecialRegisterRead(const SpecialRegNode& reg, llvm::IRBuild
         return builder->CreateLoad(builder->getInt32Ty(), slot);
     }
     if (isWasm() && reg.name == "memory_pages") return wasmMemorySize(builder);
-    auto it = special_registers.find(reg.name);
-    if (it == special_registers.end()) {
+    auto it = specialRegisters.find(reg.name);
+    if (it == specialRegisters.end()) {
         psi::ErrorStream() << "'%" << reg.name << "' isn't a recognized register for this target\n";
         return nullptr;
     }
@@ -594,7 +598,7 @@ llvm::Value* processValue(ValueNode value, llvm::IRBuilder<>* builder)
 {
     if (value.kind == ValueKind::Number) {
         if (value.numberIsFloat) {
-            return llvm::ConstantFP::get(types["f32"], value.numberAsFloat);
+            return llvm::ConstantFP::get(llvmTypes["f32"], value.numberAsFloat);
         } else {
             return builder->getInt32(value.numberAsInt);
         }
@@ -731,8 +735,8 @@ llvm::Value* processCallInstruction(CommandNode& command, llvm::IRBuilder<>* bui
     }
 
     const std::string& calleeName = command.values[0]->registerValue.name;
-    auto fnIt = function_values.find(calleeName);
-    if (fnIt == function_values.end()) {
+    auto fnIt = functionDeclarations.find(calleeName);
+    if (fnIt == functionDeclarations.end()) {
         psi::ErrorStream() << "call to undefined function '" << calleeName << "'\n";
         return nullptr;
     }
@@ -746,7 +750,7 @@ llvm::Value* processCallInstruction(CommandNode& command, llvm::IRBuilder<>* bui
         return nullptr;
     }
 
-    auto paramTypesIt = function_param_declared_types.find(calleeName);
+    auto paramTypesIt = functionParamTypes.find(calleeName);
 
     std::vector<llvm::Value*> args;
     for (size_t i = 1; i < command.values.size(); i++) {
@@ -755,7 +759,7 @@ llvm::Value* processCallInstruction(CommandNode& command, llvm::IRBuilder<>* bui
             return nullptr;
         }
         llvm::Type* paramType = callee->getFunctionType()->getParamType(i - 1);
-        bool paramIsUnsigned = paramTypesIt != function_param_declared_types.end()
+        bool paramIsUnsigned = paramTypesIt != functionParamTypes.end()
             && isUnsignedTypeName(paramTypesIt->second[i - 1].baseName);
         arg = coerceValue(arg, paramType, builder, "argument " + std::to_string(i) + " to '" + calleeName + "'", paramIsUnsigned);
         if (!arg) {
@@ -794,8 +798,8 @@ void processSpecialRegisterWrite(const SpecialRegNode& reg, llvm::Value* value, 
         psi::ErrorStream() << "'%memory_pages' is read-only; use #memory_grow\n";
         return;
     }
-    auto it = special_registers.find(reg.name);
-    if (it == special_registers.end()) {
+    auto it = specialRegisters.find(reg.name);
+    if (it == specialRegisters.end()) {
         psi::ErrorStream() << "'%" << reg.name << "' isn't a recognized register for this target\n";
         return;
     }
@@ -1759,8 +1763,8 @@ void processCommand(CommandNode command, llvm::IRBuilder<>* builder)
 
             const std::string& reg_name = command.targetRegister.name;
 
-            auto existing = values.find(reg_name);
-            if (existing != values.end()) {
+            auto existing = locals.find(reg_name);
+            if (existing != locals.end()) {
 
                 if (hasInitializer) {
                     builder->CreateStore(value, existing->second);
@@ -1772,9 +1776,9 @@ void processCommand(CommandNode command, llvm::IRBuilder<>* builder)
             if (command.declaredType.alignment > 0) {
                 reg->setAlignment(llvm::Align(command.declaredType.alignment));
             }
-            values[reg_name] = reg;
-            value_declared_types[reg_name] = command.declaredType;
-            used_values.push_back(reg_name);
+            locals[reg_name] = reg;
+            localTypes[reg_name] = command.declaredType;
+            declaredLocalNames.push_back(reg_name);
 
             if (hasInitializer) {
                 builder->CreateStore(value, reg);
@@ -1808,13 +1812,13 @@ void generateFunctionBody(const BlockNode& body, llvm::Function* function,
     const std::vector<ArgNode>* args, const std::string& diagnosticName)
 {
     labels.clear();
-    values.clear();
-    value_declared_types.clear();
-    used_values.clear();
+    locals.clear();
+    localTypes.clear();
+    declaredLocalNames.clear();
 
     current_function = function;
-    auto returnTypeIt = function_return_declared_types.find(diagnosticName);
-    current_function_return_type = (returnTypeIt != function_return_declared_types.end()) ? returnTypeIt->second : TypeNode { };
+    auto returnTypeIt = functionReturnTypes.find(diagnosticName);
+    current_function_return_type = (returnTypeIt != functionReturnTypes.end()) ? returnTypeIt->second : TypeNode { };
 
     llvm::BasicBlock* entry_block = llvm::BasicBlock::Create(*current_context, "entry", function);
     llvm::IRBuilder<> builder(*current_context);
@@ -1827,8 +1831,8 @@ void generateFunctionBody(const BlockNode& body, llvm::Function* function,
             llvm::Type* argType = arg.getType();
             auto* slot = builder.CreateAlloca(argType, nullptr, argNode.name);
             builder.CreateStore(&arg, slot);
-            values[argNode.name] = slot;
-            value_declared_types[argNode.name] = argNode.type;
+            locals[argNode.name] = slot;
+            localTypes[argNode.name] = argNode.type;
             idx++;
         }
     }
@@ -1957,7 +1961,11 @@ std::string defaultTriple(Architecture arch, OperatingSystem os)
     throw std::runtime_error("unsupported architecture/OS combination");
 }
 
-std::unique_ptr<llvm::TargetMachine> buildTargetMachine(const std::string&, std::string&);
+} // namespace
+
+namespace {
+std::unique_ptr<llvm::TargetMachine> buildTargetMachine(const std::string& triple, std::string& errorMessage);
+} // namespace
 
 std::string compileProgram(std::string name, ProgramNode program, Architecture arch, OperatingSystem os, const std::string& targetTriple)
 {
@@ -1981,46 +1989,46 @@ std::string compileProgram(std::string name, ProgramNode program, Architecture a
     if (!targetMachine) throw std::runtime_error(targetError);
     module.setDataLayout(targetMachine->createDataLayout());
 
-    types.clear();
-    types["void"] = llvm::Type::getVoidTy(context);
-    types["bool"] = llvm::Type::getInt1Ty(context);
-    types["i8"] = llvm::Type::getInt8Ty(context);
-    types["u8"] = llvm::Type::getInt8Ty(context);
-    types["i16"] = llvm::Type::getInt16Ty(context);
-    types["u16"] = llvm::Type::getInt16Ty(context);
-    types["i32"] = llvm::Type::getInt32Ty(context);
-    types["u32"] = llvm::Type::getInt32Ty(context);
-    types["i64"] = llvm::Type::getInt64Ty(context);
-    types["u64"] = llvm::Type::getInt64Ty(context);
-    types["f32"] = llvm::Type::getFloatTy(context);
-    types["f64"] = llvm::Type::getDoubleTy(context);
+    llvmTypes.clear();
+    llvmTypes["void"] = llvm::Type::getVoidTy(context);
+    llvmTypes["bool"] = llvm::Type::getInt1Ty(context);
+    llvmTypes["i8"] = llvm::Type::getInt8Ty(context);
+    llvmTypes["u8"] = llvm::Type::getInt8Ty(context);
+    llvmTypes["i16"] = llvm::Type::getInt16Ty(context);
+    llvmTypes["u16"] = llvm::Type::getInt16Ty(context);
+    llvmTypes["i32"] = llvm::Type::getInt32Ty(context);
+    llvmTypes["u32"] = llvm::Type::getInt32Ty(context);
+    llvmTypes["i64"] = llvm::Type::getInt64Ty(context);
+    llvmTypes["u64"] = llvm::Type::getInt64Ty(context);
+    llvmTypes["f32"] = llvm::Type::getFloatTy(context);
+    llvmTypes["f64"] = llvm::Type::getDoubleTy(context);
 
-    types["i8x16"] = llvm::FixedVectorType::get(llvm::Type::getInt8Ty(context), 16);
-    types["i16x8"] = llvm::FixedVectorType::get(llvm::Type::getInt16Ty(context), 8);
-    types["i32x4"] = llvm::FixedVectorType::get(llvm::Type::getInt32Ty(context), 4);
-    types["i64x2"] = llvm::FixedVectorType::get(llvm::Type::getInt64Ty(context), 2);
-    types["f32x4"] = llvm::FixedVectorType::get(llvm::Type::getFloatTy(context), 4);
-    types["f64x2"] = llvm::FixedVectorType::get(llvm::Type::getDoubleTy(context), 2);
+    llvmTypes["i8x16"] = llvm::FixedVectorType::get(llvm::Type::getInt8Ty(context), 16);
+    llvmTypes["i16x8"] = llvm::FixedVectorType::get(llvm::Type::getInt16Ty(context), 8);
+    llvmTypes["i32x4"] = llvm::FixedVectorType::get(llvm::Type::getInt32Ty(context), 4);
+    llvmTypes["i64x2"] = llvm::FixedVectorType::get(llvm::Type::getInt64Ty(context), 2);
+    llvmTypes["f32x4"] = llvm::FixedVectorType::get(llvm::Type::getFloatTy(context), 4);
+    llvmTypes["f64x2"] = llvm::FixedVectorType::get(llvm::Type::getDoubleTy(context), 2);
 
-    types["i32x8"] = llvm::FixedVectorType::get(llvm::Type::getInt32Ty(context), 8);
-    types["i64x4"] = llvm::FixedVectorType::get(llvm::Type::getInt64Ty(context), 4);
-    types["f32x8"] = llvm::FixedVectorType::get(llvm::Type::getFloatTy(context), 8);
-    types["f64x4"] = llvm::FixedVectorType::get(llvm::Type::getDoubleTy(context), 4);
+    llvmTypes["i32x8"] = llvm::FixedVectorType::get(llvm::Type::getInt32Ty(context), 8);
+    llvmTypes["i64x4"] = llvm::FixedVectorType::get(llvm::Type::getInt64Ty(context), 4);
+    llvmTypes["f32x8"] = llvm::FixedVectorType::get(llvm::Type::getFloatTy(context), 8);
+    llvmTypes["f64x4"] = llvm::FixedVectorType::get(llvm::Type::getDoubleTy(context), 4);
 
-    functions.clear();
-    function_values.clear();
-    function_param_declared_types.clear();
-    function_return_declared_types.clear();
+    functionTypes.clear();
+    functionDeclarations.clear();
+    functionParamTypes.clear();
+    functionReturnTypes.clear();
     globals.clear();
-    global_declared_types.clear();
-    struct_field_index.clear();
-    struct_field_types.clear();
+    globalTypes.clear();
+    structFieldIndex.clear();
+    structFieldTypes.clear();
 
     for (auto& dec : program.declarations) {
         if (dec.kind == DeclKind::Struct) {
             const std::string& structName = dec.structDecl.type.baseName;
-            if (!types.count(structName)) {
-                types[structName] = llvm::StructType::create(context, structName);
+            if (!llvmTypes.count(structName)) {
+                llvmTypes[structName] = llvm::StructType::create(context, structName);
             }
         }
     }
@@ -2028,7 +2036,7 @@ std::string compileProgram(std::string name, ProgramNode program, Architecture a
     for (auto& dec : program.declarations) {
         if (dec.kind == DeclKind::Struct) {
             const std::string& structName = dec.structDecl.type.baseName;
-            auto* structType = llvm::cast<llvm::StructType>(types[structName]);
+            auto* structType = llvm::cast<llvm::StructType>(llvmTypes[structName]);
             if (!structType->isOpaque()) {
                 continue;
             }
@@ -2047,14 +2055,14 @@ std::string compileProgram(std::string name, ProgramNode program, Architecture a
             }
 
             structType->setBody(fieldLlvmTypes);
-            struct_field_types[structName] = fieldTypeNodes;
-            struct_field_index[structName] = fieldIndex;
+            structFieldTypes[structName] = fieldTypeNodes;
+            structFieldIndex[structName] = fieldIndex;
         }
     }
 
     for (auto& dec : program.declarations) {
         if (dec.kind == DeclKind::Func) {
-            if (function_values.count(dec.funcDecl.name)) {
+            if (functionDeclarations.count(dec.funcDecl.name)) {
 
                 continue;
             }
@@ -2070,21 +2078,21 @@ std::string compileProgram(std::string name, ProgramNode program, Architecture a
             }
 
             auto* fnType = llvm::FunctionType::get(retType, argTypes, false);
-            functions[dec.funcDecl.name] = fnType;
+            functionTypes[dec.funcDecl.name] = fnType;
 
             std::vector<TypeNode> paramTypes;
             for (auto& arg : dec.funcDecl.args) {
                 paramTypes.push_back(arg.type);
             }
-            function_param_declared_types[dec.funcDecl.name] = paramTypes;
-            function_return_declared_types[dec.funcDecl.name] = dec.funcDecl.returnType;
+            functionParamTypes[dec.funcDecl.name] = paramTypes;
+            functionReturnTypes[dec.funcDecl.name] = dec.funcDecl.returnType;
 
             auto* fn = llvm::Function::Create(fnType, llvm::Function::ExternalLinkage, dec.funcDecl.name, module);
             size_t idx = 0;
             for (auto& arg : fn->args()) {
                 arg.setName(dec.funcDecl.args[idx++].name);
             }
-            function_values[dec.funcDecl.name] = fn;
+            functionDeclarations[dec.funcDecl.name] = fn;
         } else if (dec.kind == DeclKind::Glob || dec.kind == DeclKind::Const) {
             bool isConst = dec.kind == DeclKind::Const;
             const TypeNode& type = isConst ? dec.constDecl.type : dec.globDecl.type;
@@ -2104,7 +2112,7 @@ std::string compileProgram(std::string name, ProgramNode program, Architecture a
             auto* global = new llvm::GlobalVariable(
                 module, llvmType, isConst, llvm::GlobalValue::ExternalLinkage, init, gname);
             globals[gname] = global;
-            global_declared_types[gname] = type;
+            globalTypes[gname] = type;
         }
     }
 
@@ -2112,19 +2120,19 @@ std::string compileProgram(std::string name, ProgramNode program, Architecture a
         if (dec.kind == DeclKind::Entry) {
             const std::string& entryName = dec.entryDecl.name;
 
-            if (function_values.count(entryName)) {
+            if (functionDeclarations.count(entryName)) {
                 psi::ErrorStream() << "'" << entryName
                                    << "' is already declared as a func - entry needs its own name";
                 continue;
             }
 
-            llvm::FunctionType* entry_function_type = llvm::FunctionType::get(types["void"], { }, false);
+            llvm::FunctionType* entry_function_type = llvm::FunctionType::get(llvmTypes["void"], { }, false);
             llvm::Function* entry_function = llvm::Function::Create(
                 entry_function_type, llvm::Function::ExternalLinkage, entryName, module);
 
             generateFunctionBody(dec.entryDecl.body, entry_function, nullptr, entryName);
         } else if (dec.kind == DeclKind::Func) {
-            llvm::Function* fn = function_values[dec.funcDecl.name];
+            llvm::Function* fn = functionDeclarations[dec.funcDecl.name];
             if (dec.funcDecl.hasBody) {
                 generateFunctionBody(dec.funcDecl.body, fn, &dec.funcDecl.args, dec.funcDecl.name);
             }
@@ -2152,6 +2160,7 @@ std::string compileProgram(std::string name, ProgramNode program, Architecture a
     return output;
 }
 
+namespace {
 std::unique_ptr<llvm::TargetMachine> buildTargetMachine(const std::string& triple, std::string& errorMessage)
 {
     std::string lookupError;
@@ -2178,6 +2187,9 @@ std::unique_ptr<llvm::TargetMachine> buildTargetMachine(const std::string& tripl
     return targetMachine;
 }
 
+} // namespace
+
+namespace {
 void runOptimizationPipeline(llvm::Module& module, llvm::TargetMachine* targetMachine, OptLevel level)
 {
     if (level == OptLevel::O0) {
@@ -2221,6 +2233,8 @@ void runOptimizationPipeline(llvm::Module& module, llvm::TargetMachine* targetMa
     llvm::ModulePassManager MPM = PB.buildPerModuleDefaultPipeline(llvmLevel);
     MPM.run(module, MAM);
 }
+
+} // namespace
 
 std::string optimizeIR(const std::string& irCode, OptLevel level, std::string& errorMessage)
 {
