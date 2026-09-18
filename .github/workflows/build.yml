@@ -8,10 +8,15 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -46,15 +51,43 @@ jobs:
           brew install llvm@18 ninja
           echo "LLVM_DIR=$(brew --prefix llvm@18)/lib/cmake/llvm" >> "$GITHUB_ENV"
 
-      - name: Install LLVM and build tools (Windows)
+      # The runner's LLVM installer lacks the development libraries and all
+      # backends needed by PSIC. Cache the official full SDK instead.
+      - name: Restore LLVM SDK (Windows)
+        if: runner.os == 'Windows'
+        id: llvm-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/llvm-sdk
+          key: llvm-18.1.8-windows-x86_64-sdk-v1
+
+      - name: Download and extract LLVM SDK (Windows)
+        if: runner.os == 'Windows' && steps.llvm-cache.outputs.cache-hit != 'true'
+        timeout-minutes: 20
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = Join-Path $env:RUNNER_TEMP 'llvm-sdk.tar.xz'
+          $sdk = Join-Path $env:RUNNER_TEMP 'llvm-sdk'
+          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/clang%2Bllvm-18.1.8-x86_64-pc-windows-msvc.tar.xz"
+          Write-Host 'Downloading LLVM 18.1.8 SDK (large archive)...'
+          curl.exe -L --fail --retry 2 --connect-timeout 30 --max-time 600 --speed-limit 1024 --speed-time 60 $url -o $archive
+          if ($LASTEXITCODE -ne 0) { throw 'LLVM download failed' }
+          # Use 7-Zip for both stages instead of Windows tar's xz extraction.
+          # Keep the full SDK: LLVM's CMake exports also check tool paths.
+          Write-Host 'Decompressing LLVM SDK with 7-Zip...'
+          7z x $archive "-o$env:RUNNER_TEMP" -y -bsp1
+          if ($LASTEXITCODE -ne 0) { throw 'LLVM decompression failed' }
+          Write-Host 'Extracting LLVM SDK...'
+          7z x (Join-Path $env:RUNNER_TEMP 'llvm-sdk.tar') "-o$sdk" -y -bsp1
+          if ($LASTEXITCODE -ne 0) { throw 'LLVM extraction failed' }
+          Remove-Item $archive, (Join-Path $env:RUNNER_TEMP 'llvm-sdk.tar')
+
+      - name: Locate LLVM SDK (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $archive = "clang+llvm-18.1.8-x86_64-pc-windows-msvc.tar.xz"
-          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/clang%2Bllvm-18.1.8-x86_64-pc-windows-msvc.tar.xz"
-          curl.exe -L --fail --retry 3 $url -o $archive
-          tar -xf $archive
-          $llvmRoot = Join-Path $PWD "clang+llvm-18.1.8-x86_64-pc-windows-msvc"
+          $llvmRoot = Join-Path $env:RUNNER_TEMP 'llvm-sdk/clang+llvm-18.1.8-x86_64-pc-windows-msvc'
           $llvmConfig = Join-Path $llvmRoot "lib\cmake\llvm\LLVMConfig.cmake"
           if (-not (Test-Path $llvmConfig)) {
             throw "LLVMConfig.cmake was not found at $llvmConfig"
@@ -78,7 +111,7 @@ jobs:
           -DLLVM_DIR="$env:LLVM_DIR"
 
       - name: Build
-        run: cmake --build build-ci --config RelWithDebInfo --parallel
+        run: cmake --build build-ci --config RelWithDebInfo --parallel 2
 
       - name: Test compiler and library
         run: ctest --test-dir build-ci -C RelWithDebInfo --output-on-failure
@@ -108,6 +141,7 @@ jobs:
         shell: pwsh
         run: |
           cmake --install build-ci --prefix package --config RelWithDebInfo
+          if ($LASTEXITCODE -ne 0) { throw 'Installation failed' }
           Compress-Archive -Path package/* -DestinationPath "${{ matrix.artifact }}.zip"
 
       - name: Upload compiler artifact

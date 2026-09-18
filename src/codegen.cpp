@@ -1,6 +1,7 @@
 #include "codegen.hpp"
 
 #include <llvm/Analysis/CGSCCPassManager.h>
+#include <llvm/Config/llvm-config.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/DiagnosticInfo.h>
 #include <llvm/IR/DiagnosticPrinter.h>
@@ -32,15 +33,24 @@
 #include <llvm/TargetParser/Host.h>
 #include <unordered_map>
 
-static void captureLLVMDiagnostic(const llvm::DiagnosticInfo* info, void*)
+#if LLVM_VERSION_MAJOR >= 19
+static void captureLLVMDiagnostic(const llvm::DiagnosticInfo* diagnostic, void*)
+#else
+static void captureLLVMDiagnostic(const llvm::DiagnosticInfo& diagnostic, void*)
+#endif
 {
+#if LLVM_VERSION_MAJOR >= 19
+    const auto& info = *diagnostic;
+#else
+    const auto& info = diagnostic;
+#endif
     std::string message;
     llvm::raw_string_ostream stream(message);
     llvm::DiagnosticPrinterRawOStream printer(stream);
-    info->print(printer);
-    if (info->getSeverity() == llvm::DS_Error) psi::logError(message);
-    else if (info->getSeverity() == llvm::DS_Warning) psi::logWarning(message);
-    else if (info->getSeverity() == llvm::DS_Note) psi::logNote(message);
+    info.print(printer);
+    if (info.getSeverity() == llvm::DS_Error) psi::logError(message);
+    else if (info.getSeverity() == llvm::DS_Warning) psi::logWarning(message);
+    else if (info.getSeverity() == llvm::DS_Note) psi::logNote(message);
 }
 
 std::unordered_map<std::string, llvm::Type*> types;
