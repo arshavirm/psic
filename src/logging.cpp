@@ -9,6 +9,14 @@ namespace {
     thread_local int errors = 0;
     thread_local int warnings = 0;
     thread_local std::vector<psic::Diagnostic>* diagnosticSink = nullptr;
+
+    std::string stripTrailingNewline(std::string message)
+    {
+        if (!message.empty() && message.back() == '\n') {
+            message.pop_back();
+        }
+        return message;
+    }
 }
 
 std::vector<psic::Diagnostic>* setDiagnosticSink(std::vector<psic::Diagnostic>* sink)
@@ -75,33 +83,25 @@ void resetErrors()
     warnings = 0;
 }
 
-ErrorStream::~ErrorStream()
+DiagnosticStream::~DiagnosticStream()
 {
-    std::string message = buffer.str();
-    if (!message.empty() && message.back() == '\n') {
-        message.pop_back();
+    const std::string message = stripTrailingNewline(buffer.str());
+    switch (kind) {
+    case detail::StreamKind::Error:
+        logError(message);
+        break;
+    case detail::StreamKind::Warning:
+        logWarning(message);
+        break;
+    case detail::StreamKind::Note:
+        logNote(message);
+        break;
+    case detail::StreamKind::VerboseInfo:
+        if (verboseEnabled && !diagnosticSink && !message.empty()) {
+            std::cerr << "psic: " << message << "\n";
+        }
+        break;
     }
-    logError(message);
-}
-
-InfoStream::~InfoStream()
-{
-    std::string message = buffer.str();
-    if (!message.empty() && message.back() == '\n') {
-        message.pop_back();
-    }
-    if (verboseEnabled && !diagnosticSink && !message.empty()) {
-        std::cerr << "psic: " << message << "\n";
-    }
-}
-
-WarningStream::~WarningStream()
-{
-    std::string message = buffer.str();
-    if (!message.empty() && message.back() == '\n') {
-        message.pop_back();
-    }
-    logWarning(message);
 }
 
 }

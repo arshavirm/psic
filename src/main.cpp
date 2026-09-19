@@ -88,7 +88,53 @@ static bool isOption(const std::string& arg)
     return arg.size() > 1 && arg[0] == '-';
 }
 
-static bool requireValue(int argc, char** argv, int& i, const std::string& option,
+namespace {
+
+enum class OptionAction {
+    ShowHelp,
+    ShowVersion,
+    SetVerbose,
+    CompileOnly,
+    EmitLLVM,
+    SetOutput,
+    SetTargetTriple,
+    SetArch,
+    SetOs,
+    SetOptLevel,
+};
+
+struct OptionSpec {
+    const char* name;
+    OptionAction action;
+    bool takesValue;
+};
+
+// All spellings of every command-line option. Value-taking options also
+// accept a `--name=value` form, handled below from the same table.
+constexpr OptionSpec optionSpecs[] = {
+    {"-h", OptionAction::ShowHelp, false},       {"--help", OptionAction::ShowHelp, false},
+    {"--version", OptionAction::ShowVersion, false},
+    {"-v", OptionAction::SetVerbose, false},     {"--verbose", OptionAction::SetVerbose, false},
+    {"-c", OptionAction::CompileOnly, false},    {"--compile", OptionAction::CompileOnly, false},
+    {"--emit-llvm", OptionAction::EmitLLVM, false},
+    {"-o", OptionAction::SetOutput, true},       {"--output", OptionAction::SetOutput, true},
+    {"-target", OptionAction::SetTargetTriple, true}, {"--target", OptionAction::SetTargetTriple, true},
+    {"-march", OptionAction::SetArch, true},     {"--arch", OptionAction::SetArch, true},
+    {"-mos", OptionAction::SetOs, true},         {"--os", OptionAction::SetOs, true},
+    {"-O0", OptionAction::SetOptLevel, false},   {"-O1", OptionAction::SetOptLevel, false},
+    {"-O2", OptionAction::SetOptLevel, false},   {"-O3", OptionAction::SetOptLevel, false},
+    {"-Os", OptionAction::SetOptLevel, false},   {"-Oz", OptionAction::SetOptLevel, false},
+};
+
+const OptionSpec* findOption(const std::string& arg)
+{
+    for (const auto& spec : optionSpecs)
+        if (arg == spec.name)
+            return &spec;
+    return nullptr;
+}
+
+bool requireValue(int argc, char** argv, int& i, const std::string& option,
     std::string& value)
 {
     if (i + 1 >= argc) {
@@ -105,6 +151,47 @@ static bool requireValue(int argc, char** argv, int& i, const std::string& optio
     return true;
 }
 
+bool applyOption(const OptionSpec& spec, int argc, char** argv, int& i,
+    const std::string& arg, const std::string& inlineValue, Options& options)
+{
+    std::string value;
+    if (spec.takesValue) {
+        // `--name=value` uses the inline value; otherwise consume the next argv.
+        if (inlineValue.empty() && arg.find('=') == std::string::npos
+            && !requireValue(argc, argv, i, arg, value)) {
+            return false;
+        }
+        if (!inlineValue.empty()) {
+            value = inlineValue;
+        }
+    }
+
+    switch (spec.action) {
+    case OptionAction::ShowHelp: options.showHelp = true; break;
+    case OptionAction::ShowVersion: options.showVersion = true; break;
+    case OptionAction::SetVerbose: options.verbose = true; break;
+    case OptionAction::CompileOnly: options.compileOnly = true; break;
+    case OptionAction::EmitLLVM: options.emitIR = true; break;
+    case OptionAction::SetOutput: options.output = value; break;
+    case OptionAction::SetTargetTriple: options.targetTriple = value; break;
+    case OptionAction::SetArch: options.arch = value; break;
+    case OptionAction::SetOs: options.os = value; break;
+    case OptionAction::SetOptLevel:
+        options.opt = [](const char* name) {
+            if (name == std::string("-O1")) return OptLevel::O1;
+            if (name == std::string("-O3")) return OptLevel::O3;
+            if (name == std::string("-Os")) return OptLevel::Os;
+            if (name == std::string("-Oz")) return OptLevel::Oz;
+            if (name == std::string("-O0")) return OptLevel::O0;
+            return OptLevel::O2;
+        }(spec.name);
+        break;
+    }
+    return true;
+}
+
+} // namespace
+
 static bool parseArguments(int argc, char** argv, Options& options)
 {
     bool endOfOptions = false;
@@ -117,134 +204,45 @@ static bool parseArguments(int argc, char** argv, Options& options)
             continue;
         }
 
-        if (!endOfOptions && (arg == "-h" || arg == "--help")) {
-            options.showHelp = true;
-            continue;
-        }
+        if (!endOfOptions) {
+            const OptionSpec* spec = findOption(arg);
+            if (spec) {
+                if (!applyOption(*spec, argc, argv, i, arg, "", options))
+                    return false;
+                continue;
+            }
 
-        if (!endOfOptions && arg == "--version") {
-            options.showVersion = true;
-            continue;
-        }
+            // `--name=value` forms reuse the same option table.
+            const auto equals = arg.find('=');
+            if (equals != std::string::npos) {
+                const std::string name = arg.substr(0, equals);
+                const OptionSpec* inlineSpec = findOption(name);
+                if (inlineSpec && inlineSpec->takesValue) {
+                    const std::string inlineValue = arg.substr(equals + 1);
+                    if (inlineValue.empty()) {
+                        psi::logError("'" + name + "=' requires an argument");
+                        return false;
+                    }
+                    if (!applyOption(*inlineSpec, argc, argv, i, name, inlineValue, options))
+                        return false;
+                    continue;
+                }
+            }
 
-        if (!endOfOptions && (arg == "-v" || arg == "--verbose")) {
-            options.verbose = true;
-            continue;
-        }
+            if (arg == "-") {
+                if (!options.input.empty()) {
+                    psi::logError("multiple input files are not supported");
+                    return false;
+                }
+                options.input = "-";
+                continue;
+            }
 
-        if (!endOfOptions && (arg == "-c" || arg == "--compile")) {
-            options.compileOnly = true;
-            continue;
-        }
-
-        if (!endOfOptions && arg == "--emit-llvm") {
-            options.emitIR = true;
-            continue;
-        }
-
-        if (!endOfOptions && (arg == "-o" || arg == "--output")) {
-            if (!requireValue(argc, argv, i, arg, options.output))
-                return false;
-            continue;
-        }
-
-        if (!endOfOptions && (arg == "-target" || arg == "--target")) {
-            if (!requireValue(argc, argv, i, arg, options.targetTriple))
-                return false;
-            continue;
-        }
-
-        if (!endOfOptions && (arg == "-march" || arg == "--arch")) {
-            if (!requireValue(argc, argv, i, arg, options.arch))
-                return false;
-            continue;
-        }
-
-        if (!endOfOptions && (arg == "-mos" || arg == "--os")) {
-            if (!requireValue(argc, argv, i, arg, options.os))
-                return false;
-            continue;
-        }
-
-        if (!endOfOptions && (arg == "-O0")) {
-            options.opt = OptLevel::O0;
-            continue;
-        }
-
-        if (!endOfOptions && (arg == "-O1")) {
-            options.opt = OptLevel::O1;
-            continue;
-        }
-
-        if (!endOfOptions && (arg == "-O2")) {
-            options.opt = OptLevel::O2;
-            continue;
-        }
-
-        if (!endOfOptions && (arg == "-O3")) {
-            options.opt = OptLevel::O3;
-            continue;
-        }
-
-        if (!endOfOptions && (arg == "-Os")) {
-            options.opt = OptLevel::Os;
-            continue;
-        }
-
-        if (!endOfOptions && (arg == "-Oz")) {
-            options.opt = OptLevel::Oz;
-            continue;
-        }
-
-        if (!endOfOptions && arg.rfind("--target=", 0) == 0) {
-            options.targetTriple = arg.substr(9);
-            if (options.targetTriple.empty()) {
-                psi::logError("'--target=' requires an argument");
+            if (isOption(arg)) {
+                psi::logError("unknown option '" + arg + "'");
+                psi::logNote("use 'psic --help' for usage information");
                 return false;
             }
-            continue;
-        }
-
-        if (!endOfOptions && arg.rfind("--arch=", 0) == 0) {
-            options.arch = arg.substr(7);
-            if (options.arch.empty()) {
-                psi::logError("'--arch=' requires an argument");
-                return false;
-            }
-            continue;
-        }
-
-        if (!endOfOptions && arg.rfind("--os=", 0) == 0) {
-            options.os = arg.substr(5);
-            if (options.os.empty()) {
-                psi::logError("'--os=' requires an argument");
-                return false;
-            }
-            continue;
-        }
-
-        if (!endOfOptions && arg.rfind("--output=", 0) == 0) {
-            options.output = arg.substr(9);
-            if (options.output.empty()) {
-                psi::logError("'--output=' requires an argument");
-                return false;
-            }
-            continue;
-        }
-
-        if (!endOfOptions && arg == "-") {
-            if (!options.input.empty()) {
-                psi::logError("multiple input files are not supported");
-                return false;
-            }
-            options.input = "-";
-            continue;
-        }
-
-        if (!endOfOptions && isOption(arg)) {
-            psi::logError("unknown option '" + arg + "'");
-            psi::logNote("use 'psic --help' for usage information");
-            return false;
         }
 
         if (!options.input.empty()) {

@@ -1,4 +1,5 @@
 #include <psic/compiler.hpp>
+#include "codegen.hpp"
 #include "lexer.hpp"
 #include "parser.hpp"
 #include "target.hpp"
@@ -44,13 +45,13 @@ CompileResult compile(const std::string& source, const CompileOptions& options)
         Parser parser(lexer.tokenize());
         ProgramNode program = parser.parseProgram();
         validateProgram(program);
-        std::string ir = compileProgram(options.moduleName, program, arch, os, options.targetTriple);
+        std::string ir = psi_codegen::compileProgram(options.moduleName, program, arch, os, options.targetTriple);
         if (psi::hadErrors()) return result;
         std::string error;
         if (options.output == OutputKind::LLVMIR) {
-            result.ir = optimizeIR(ir, options.optimization, error);
+            result.ir = psi_codegen::optimizeIR(ir, options.optimization, error);
         } else {
-            if (!compileToObjectMemory(ir, options.targetTriple, result.object, options.optimization, error)
+            if (!psi_codegen::compileToObjectMemory(ir, options.targetTriple, result.object, options.optimization, error)
                 && error.empty() && !psi::hadErrors())
                 error = "object generation failed";
         }

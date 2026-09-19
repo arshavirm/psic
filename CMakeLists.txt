@@ -15,7 +15,8 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 add_library(psic_lib
-    src/compiler.cpp src/target.cpp src/codegen.cpp src/validation.cpp
+    src/compiler.cpp src/target.cpp src/codegen.cpp src/codegen_module.cpp
+    src/codegen_instructions.cpp src/codegen_registers.cpp src/validation.cpp
     src/lexer.cpp src/parser.cpp src/logging.cpp)
 add_library(PSIC::psic ALIAS psic_lib)
 set_target_properties(psic_lib PROPERTIES
