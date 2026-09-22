@@ -3,7 +3,47 @@
 #include <cstdint>
 #include <string>
 #include <vector>
-#include <psic/export.hpp>
+
+#ifndef PSIC_EXPORT_HPP
+#define PSIC_EXPORT_HPP
+
+// Automatically generated export header for PSIC library
+// This header defines the PSIC_EXPORT macro for DLL/shared library visibility
+
+#ifdef PSIC_STATIC_DEFINE
+  // Static library - no export/import needed
+#  define PSIC_EXPORT
+#else
+#  ifdef _WIN32
+    // Windows DLL import/export
+#    ifdef psic_lib_EXPORTS
+       // Building the library - export symbols
+#      define PSIC_EXPORT __declspec(dllexport)
+#    else
+       // Using the library - import symbols
+#      define PSIC_EXPORT __declspec(dllimport)
+#    endif
+#  else
+    // Unix-like systems - use visibility attribute
+#    define PSIC_EXPORT __attribute__((visibility("default")))
+#  endif
+#endif
+
+// Deprecated macro for marking deprecated API elements
+#ifndef PSIC_DEPRECATED
+#  ifdef _MSC_VER
+#    define PSIC_DEPRECATED __declspec(deprecated)
+#  else
+#    define PSIC_DEPRECATED __attribute__((__deprecated__))
+#  endif
+#endif
+
+// No-op macro for future use
+#ifndef PSIC_NOEXCEPT
+#  define PSIC_NOEXCEPT noexcept
+#endif
+
+#endif // PSIC_EXPORT_HPP
 
 namespace psic {
 
