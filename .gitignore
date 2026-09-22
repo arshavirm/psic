@@ -1,75 +1,90 @@
-# Prerequisites
-*.d
-
-# Compiled Object files
-*.slo
-*.lo
+```
+# Compiled and build artifacts
 *.o
 *.obj
-
-# Precompiled Headers
-*.gch
-*.pch
-
-# Linker files
-*.ilk
-
-# Debugger Files
-*.pdb
-
-# Compiled Dynamic libraries
-*.so
-*.dylib
-*.dll
-*.so.*
-
-
-# Fortran module files
-*.mod
-*.smod
-
-# Compiled Static libraries
-*.lai
-*.la
-*.a
-*.lib
-
-# Executables
-*.exe
 *.out
-*.app
+*.a
+*.so
+*.dll
+*.exe
+
+# Dependencies
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+.env
+.env.local
+.env.*
 
 # Build directories
 build/
-Build/
-build-*/
+dist/
+target/
+*.egg-info/
 
-# CMake generated files
-CMakeFiles/
-CMakeCache.txt
-cmake_install.cmake
-Makefile
-install_manifest.txt
-compile_commands.json
-
-# Temporary files
-*.tmp
+# Logs and temp files
 *.log
-*.bak
+*.tmp
 *.swp
+*.swo
 
-# vcpkg
-vcpkg_installed/
+# Editors
+.vscode/
+.idea/
+*.iml
+*.ipr
+*.iws
 
-# debug information files
-*.dwo
+# OS generated files
+.DS_Store
+Thumbs.db
+desktop.ini
 
-# test output & cache
-Testing/
-.cache/
+# Coverage reports
+coverage/
+htmlcov/
+.coverage
+*.cover
+coverage.xml
 
-# PSI files
-*.psi
-# Keep compiler regression fixtures in version control
-!tests/**/*.psi
-!tests/*.psi
+# MyPy cache
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pytest cache
+.pytest_cache/
+
+# Gradle
+.gradle/
+build/
+
+# Compressed files
+*.zip
+*.gz
+*.tar
+*.tgz
+*.bz2
+*.xz
+*.7z
+*.rar
+*.zst
+*.lz4
+*.lzh
+*.cab
+*.arj
+*.rpm
+*.deb
+*.Z
+*.lz
+*.lzo
+*.tar.gz
+*.tar.bz2
+*.tar.xz
+*.tar.zst
+```
