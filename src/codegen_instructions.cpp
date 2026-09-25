@@ -5,27 +5,27 @@
 #include <llvm/IR/GlobalVariable.h>
 #include <llvm/IR/InlineAsm.h>
 #include <llvm/IR/Instructions.h>
-#include <llvm/IR/InlineAsm.h>
 #include <llvm/IR/IntrinsicsWebAssembly.h>
 #include <llvm/IR/IntrinsicsX86.h>
 #include <llvm/IR/Verifier.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <unordered_map>
 
 namespace psi_codegen {
 
-llvm::Value* processValue(State& s, ValueNode value, llvm::IRBuilder<>* builder)
+llvm::Value* processValue(State& s, const ValueNode& value, llvm::IRBuilder<>* builder)
 {
-    if (value.kind == ValueKind::Number) {
+    switch (value.kind) {
+    case ValueKind::Number:
         if (value.numberIsFloat) {
             return llvm::ConstantFP::get(s.llvmTypes["f32"], value.numberAsFloat);
-        } else {
-            return builder->getInt32(value.numberAsInt);
         }
-    } else if (value.kind == ValueKind::String) {
+        return builder->getInt32(value.numberAsInt);
+    case ValueKind::String:
         return builder->CreateGlobalStringPtr(value.stringValue);
-    } else if (value.kind == ValueKind::Register) {
+    case ValueKind::Register: {
         RegisterAddress access = resolveRegisterAddress(s, value.registerValue, builder);
         if (!access.address) {
             return nullptr;
@@ -35,14 +35,14 @@ llvm::Value* processValue(State& s, ValueNode value, llvm::IRBuilder<>* builder)
             return nullptr;
         }
         return builder->CreateLoad(llvmType, access.address);
-    } else if (value.kind == ValueKind::SpecialRegister) {
+    }
+    case ValueKind::SpecialRegister:
         return processSpecialRegisterRead(s, value.specialRegisterValue, builder);
-    } else if (value.kind == ValueKind::Bool) {
+    case ValueKind::Bool:
         return llvm::ConstantInt::get(llvm::Type::getInt1Ty(*s.context), value.boolValue ? 1 : 0);
-    } else if (value.kind == ValueKind::Null) {
-
+    case ValueKind::Null:
         return llvm::ConstantPointerNull::get(llvm::PointerType::get(*s.context, 0));
-    } else if (value.kind == ValueKind::Array) {
+    case ValueKind::Array:
         psi::ErrorStream() << "array literals can only be used directly as a register's "
                               "initializer (e.g. 'i32* arr = [1, 2, 3];'), not as a general value\n";
         return nullptr;
@@ -82,21 +82,13 @@ llvm::Value* coerceValue(llvm::Value* value, llvm::Type* targetType, llvm::IRBui
         return value;
     }
 
-    if (fromType->isPointerTy() && targetType->isIntegerTy()) {
-        return builder->CreatePtrToInt(value, targetType);
-    }
-
-    if (fromType->isIntegerTy() && targetType->isPointerTy()) {
-        return builder->CreateIntToPtr(value, targetType);
-    }
-
     psi::ErrorStream() << "type mismatch in " << context << ": can't use this value here";
     return nullptr;
 }
 
 namespace {
 
-llvm::Value* buildLocalArrayLiteral(State& s, ValueNode& arrayValue, const TypeNode& declaredType, llvm::IRBuilder<>* builder)
+llvm::Value* buildLocalArrayLiteral(State& s, const ValueNode& arrayValue, const TypeNode& declaredType, llvm::IRBuilder<>* builder)
 {
     if (declaredType.pointerLevel < 1) {
         psi::ErrorStream() << "array initializer for '" << declaredType.baseName
@@ -150,7 +142,7 @@ void predeclareLabels(State& s, const std::vector<CommandNode>& commands, llvm::
     }
 }
 
-llvm::Value* processCallInstruction(State& s, CommandNode& command, llvm::IRBuilder<>* builder)
+llvm::Value* processCallInstruction(State& s, const CommandNode& command, llvm::IRBuilder<>* builder)
 {
     if (command.values.empty() || command.values[0]->kind != ValueKind::Register) {
         psi::ErrorStream() << "'call' needs a function name as its first operand\n";
@@ -194,7 +186,7 @@ llvm::Value* processCallInstruction(State& s, CommandNode& command, llvm::IRBuil
     return builder->CreateCall(callee, args);
 }
 
-llvm::Value* processRefInstruction(State& s, CommandNode& command, llvm::IRBuilder<>* builder)
+llvm::Value* processRefInstruction(State& s, const CommandNode& command, llvm::IRBuilder<>* builder)
 {
     if (command.values.empty() || command.values[0]->kind != ValueKind::Register) {
         psi::ErrorStream() << "'ref' needs a register operand\n";
@@ -204,7 +196,7 @@ llvm::Value* processRefInstruction(State& s, CommandNode& command, llvm::IRBuild
     return access.address;
 }
 
-llvm::Value* processSyscallInstruction(State& s, CommandNode& command, llvm::IRBuilder<>* builder)
+llvm::Value* processSyscallInstruction(State& s, const CommandNode& command, llvm::IRBuilder<>* builder)
 {
     if (s.os != OperatingSystem::Linux) {
         psi::ErrorStream() << "'#syscall' currently supports only the Linux syscall ABI\n";
@@ -287,9 +279,8 @@ llvm::Value* processSyscallInstruction(State& s, CommandNode& command, llvm::IRB
     }
 
     std::string constraints = "=" + std::string(abi->output);
-    size_t index = 0;
-    for (size_t i = 0; i < operands.size(); ++i)
-        constraints += "," + std::string((abi->operandRegs.begin())[index++]);
+    for (std::size_t i = 0; i < operands.size(); ++i)
+        constraints += "," + std::string(abi->operandRegs.begin()[i]);
 
     constraints += abi->clobbers;
 
@@ -301,7 +292,7 @@ llvm::Value* processSyscallInstruction(State& s, CommandNode& command, llvm::IRB
 
 llvm::Value* processFloatArithmeticInstruction(State& s,
     const std::string& op,
-    CommandNode& command,
+    const CommandNode& command,
     llvm::IRBuilder<>* builder)
 {
     if (command.values.size() != 2) {
@@ -369,7 +360,7 @@ llvm::Value* processUnaryIntegerIntrinsic(State& s,
 
 llvm::Value* processVectorArithmeticInstruction(State& s,
     const std::string& name,
-    CommandNode& command,
+    const CommandNode& command,
     llvm::IRBuilder<>* builder)
 {
     if (command.values.size() != 2) {
@@ -434,7 +425,7 @@ llvm::Value* processVectorArithmeticInstruction(State& s,
     return nullptr;
 }
 
-llvm::Value* processVectorFmaInstruction(State& s, CommandNode& command, llvm::IRBuilder<>* builder)
+llvm::Value* processVectorFmaInstruction(State& s, const CommandNode& command, llvm::IRBuilder<>* builder)
 {
     if (command.values.size() != 3) {
         psi::ErrorStream() << "'#vfma' needs exactly 3 operands: a, b, c (computes a*b + c)\n";
@@ -463,7 +454,7 @@ llvm::Value* processVectorFmaInstruction(State& s, CommandNode& command, llvm::I
 }
 
 llvm::Value* processVectorSplatInstruction(State& s,
-    CommandNode& command,
+    const CommandNode& command,
     llvm::IRBuilder<>* builder,
     const TypeNode* declaredType)
 {
@@ -504,7 +495,7 @@ llvm::Value* processVectorSplatInstruction(State& s,
 llvm::Value* processAtomicRMWInstruction(State& s,
     const std::string& name,
     llvm::AtomicRMWInst::BinOp op,
-    CommandNode& command,
+    const CommandNode& command,
     llvm::IRBuilder<>* builder)
 {
     if (command.values.size() != 2) {
@@ -540,7 +531,7 @@ llvm::Value* processAtomicRMWInstruction(State& s,
 }
 
 llvm::Value* processAtomicLoadInstruction(State& s,
-    CommandNode& command,
+    const CommandNode& command,
     llvm::IRBuilder<>* builder,
     const TypeNode* declaredType)
 {
@@ -573,7 +564,7 @@ llvm::Value* processAtomicLoadInstruction(State& s,
     return load;
 }
 
-llvm::Value* processAtomicStoreInstruction(State& s, CommandNode& command, llvm::IRBuilder<>* builder)
+llvm::Value* processAtomicStoreInstruction(State& s, const CommandNode& command, llvm::IRBuilder<>* builder)
 {
     if (command.values.size() != 2) {
         psi::ErrorStream() << "'#atomicstore' needs exactly 2 operands (pointer, value)\n";
@@ -596,7 +587,7 @@ llvm::Value* processAtomicStoreInstruction(State& s, CommandNode& command, llvm:
     return nullptr;
 }
 
-llvm::Value* processAtomicCasInstruction(State& s, CommandNode& command, llvm::IRBuilder<>* builder)
+llvm::Value* processAtomicCasInstruction(State& s, const CommandNode& command, llvm::IRBuilder<>* builder)
 {
     if (command.values.size() != 3) {
         psi::ErrorStream() << "'#cas' needs exactly 3 operands (pointer, expected, desired)\n";
@@ -628,13 +619,136 @@ llvm::Value* processAtomicCasInstruction(State& s, CommandNode& command, llvm::I
     return builder->CreateExtractValue(cmpxchg, 0);
 }
 
+enum class NativeInstructionResult {
+    NotHandled,
+    Handled,
+};
+
+NativeInstructionResult processNativeInstruction(State& s, const std::string& name,
+    const CommandNode& command, llvm::IRBuilder<>* builder)
+{
+    const bool x86 = s.architecture == Architecture::X86 || s.architecture == Architecture::X86_64;
+    const bool riscv = s.architecture == Architecture::RISCV32 || s.architecture == Architecture::RISCV64;
+    const bool ppc = s.architecture == Architecture::PPC32 || s.architecture == Architecture::PPC64
+        || s.architecture == Architecture::PPC64LE;
+    const bool mips = s.architecture == Architecture::MIPS || s.architecture == Architecture::MIPSEL
+        || s.architecture == Architecture::MIPS64 || s.architecture == Architecture::MIPS64EL;
+
+    std::string assembly;
+    bool memoryBarrier = false;
+    if (name == "nop") {
+        if (isWasm(s)) {
+            if (!command.values.empty()) psi::ErrorStream() << "'#nop' takes no operands\n";
+            return NativeInstructionResult::Handled;
+        }
+        assembly = s.architecture == Architecture::SystemZ ? "bcr 0, 0" : "nop";
+    }
+    if (x86 && (name == "lfence" || name == "sfence" || name == "mfence")) {
+        assembly = name;
+        memoryBarrier = true;
+    }
+    if (isARM(s.architecture)) {
+        if (name == "dmb" || name == "dsb" || name == "isb") {
+            assembly = name + " sy";
+            memoryBarrier = true;
+        }
+        if (name == "wfi" || name == "wfe" || name == "sev" || name == "sevl") {
+            if (name != "sevl" || isAArch64(s.architecture)) assembly = name;
+        }
+    }
+    if (riscv) {
+        if (name == "ecall" || name == "ebreak" || name == "wfi") {
+            assembly = name;
+            memoryBarrier = true;
+        }
+        if (name == "fence_i") {
+            assembly = "fence.i";
+            memoryBarrier = true;
+        }
+    }
+    if (ppc && (name == "sync" || name == "lwsync" || name == "isync" || name == "eieio")) {
+        assembly = name;
+        memoryBarrier = true;
+    }
+    if (mips && name == "sync") {
+        assembly = "sync";
+        memoryBarrier = true;
+    }
+    if (s.architecture == Architecture::LoongArch64 && (name == "dbar" || name == "ibar")) {
+        assembly = name + " 0";
+        memoryBarrier = true;
+    }
+    if (s.architecture == Architecture::SystemZ && name == "serialize") {
+        assembly = "bcr 15, 0";
+        memoryBarrier = true;
+    }
+    if (assembly.empty()) return NativeInstructionResult::NotHandled;
+    if (!command.values.empty()) {
+        psi::ErrorStream() << "'#" << name << "' takes no operands\n";
+        return NativeInstructionResult::Handled;
+    }
+
+    auto* functionType = llvm::FunctionType::get(builder->getVoidTy(), false);
+    auto* assemblyFunction = llvm::InlineAsm::get(functionType, assembly,
+        memoryBarrier ? "~{memory}" : "", true);
+    builder->CreateCall(assemblyFunction);
+    return NativeInstructionResult::Handled;
+}
+
 llvm::Value* processSpecialInstruction(State& s,
-    CommandNode& command,
+    const CommandNode& command,
     llvm::IRBuilder<>* builder,
     const TypeNode* declaredType)
 {
     std::string name = command.instruction.name;
     std::replace(name.begin(), name.end(), '.', '_');
+
+    if (name == "ptrcast" || name == "ptrtoint" || name == "inttoptr") {
+        if (!declaredType || command.values.size() != 1) {
+            psi::ErrorStream() << "'#" << name
+                               << "' requires one operand and an explicitly typed result\n";
+            return nullptr;
+        }
+        llvm::Value* operand = processValue(s, *command.values[0], builder);
+        llvm::Type* resultType = resolveType(s, *declaredType);
+        if (!operand || !resultType) return nullptr;
+        llvm::Type* sourceType = operand->getType();
+        if (name == "ptrcast") {
+            if (!sourceType->isPointerTy() || !resultType->isPointerTy()) {
+                psi::ErrorStream() << "'#ptrcast' requires pointer source and result types\n";
+                return nullptr;
+            }
+            return operand;
+        }
+        if (name == "ptrtoint") {
+            if (!sourceType->isPointerTy() || !resultType->isIntegerTy()) {
+                psi::ErrorStream() << "'#ptrtoint' requires a pointer operand and integer result\n";
+                return nullptr;
+            }
+            const auto& layout = builder->GetInsertBlock()->getModule()->getDataLayout();
+            auto* pointerType = llvm::cast<llvm::PointerType>(sourceType);
+            if (layout.isNonIntegralPointerType(pointerType)
+                || layout.getPointerSizeInBits(pointerType->getAddressSpace())
+                    != resultType->getIntegerBitWidth()) {
+                psi::ErrorStream() << "'#ptrtoint' result width must match an integral pointer representation\n";
+                return nullptr;
+            }
+            return builder->CreatePtrToInt(operand, resultType);
+        }
+        if (!sourceType->isIntegerTy() || !resultType->isPointerTy()) {
+            psi::ErrorStream() << "'#inttoptr' requires an integer operand and pointer result\n";
+            return nullptr;
+        }
+        const auto& layout = builder->GetInsertBlock()->getModule()->getDataLayout();
+        auto* pointerType = llvm::cast<llvm::PointerType>(resultType);
+        if (layout.isNonIntegralPointerType(pointerType)
+            || layout.getPointerSizeInBits(pointerType->getAddressSpace())
+                != sourceType->getIntegerBitWidth()) {
+            psi::ErrorStream() << "'#inttoptr' operand width must match an integral pointer representation\n";
+            return nullptr;
+        }
+        return builder->CreateIntToPtr(operand, resultType);
+    }
 
     if (name == "memory_size" || name == "memory_grow") {
         if (!isWasm(s)) {
@@ -658,46 +772,9 @@ llvm::Value* processSpecialInstruction(State& s,
         return builder->CreateCall(fn, {builder->getInt32(0), amount});
     }
 
-    // Fixed, operand-free native instructions. Keeping this allowlist target-specific
-    // prevents accidental use of another architecture's assembly syntax.
     const bool x86 = s.architecture == Architecture::X86 || s.architecture == Architecture::X86_64;
-    const bool riscv = s.architecture == Architecture::RISCV32 || s.architecture == Architecture::RISCV64;
-    const bool ppc = s.architecture == Architecture::PPC32 || s.architecture == Architecture::PPC64 || s.architecture == Architecture::PPC64LE;
-    const bool mips = s.architecture == Architecture::MIPS || s.architecture == Architecture::MIPSEL || s.architecture == Architecture::MIPS64 || s.architecture == Architecture::MIPS64EL;
-    std::string native;
-    bool memoryBarrier = false;
-    if (name == "nop") {
-        if (isWasm(s)) {
-            if (!command.values.empty()) psi::ErrorStream() << "'#nop' takes no operands\n";
-            return nullptr;
-        }
-        native = s.architecture == Architecture::SystemZ ? "bcr 0, 0" : "nop";
-    }
-    if (x86 && (name == "lfence" || name == "sfence" || name == "mfence")) { native = name; memoryBarrier = true; }
-    if (isARM(s.architecture)) {
-        if (name == "dmb" || name == "dsb" || name == "isb") { native = name + " sy"; memoryBarrier = true; }
-        if (name == "wfi" || name == "wfe" || name == "sev" || name == "sevl") {
-            if (name != "sevl" || isAArch64(s.architecture)) native = name;
-        }
-    }
-    if (riscv) {
-        if (name == "ecall" || name == "ebreak" || name == "wfi") { native = name; memoryBarrier = true; }
-        if (name == "fence_i") { native = "fence.i"; memoryBarrier = true; }
-    }
-    if (ppc && (name == "sync" || name == "lwsync" || name == "isync" || name == "eieio")) { native = name; memoryBarrier = true; }
-    if (mips && name == "sync") { native = "sync"; memoryBarrier = true; }
-    if (s.architecture == Architecture::LoongArch64 && (name == "dbar" || name == "ibar")) { native = name + " 0"; memoryBarrier = true; }
-    if (s.architecture == Architecture::SystemZ && name == "serialize") { native = "bcr 15, 0"; memoryBarrier = true; }
-    if (!native.empty()) {
-        if (!command.values.empty()) {
-            psi::ErrorStream() << "'#" << name << "' takes no operands\n";
-            return nullptr;
-        }
-        auto* fn = llvm::InlineAsm::get(llvm::FunctionType::get(builder->getVoidTy(), false),
-            native, memoryBarrier ? "~{memory}" : "", true);
-        builder->CreateCall(fn);
-        return nullptr;
-    }
+    const NativeInstructionResult nativeResult = processNativeInstruction(s, name, command, builder);
+    if (nativeResult == NativeInstructionResult::Handled) return nullptr;
 
     if (name == "syscall")
         return processSyscallInstruction(s, command, builder);
@@ -835,9 +912,262 @@ llvm::Value* processSpecialInstruction(State& s,
     return nullptr;
 }
 
+void processUntargetedInstruction(State& s, const CommandNode& command, llvm::IRBuilder<>* builder)
+{
+    const std::string& instruction = command.instruction.name;
+    if (instruction == "ret") {
+        if (command.values.empty()) {
+            builder->CreateRetVoid();
+            return;
+        }
+        llvm::Value* value = processValue(s, *command.values[0], builder);
+        if (!value) return;
+        value = coerceValue(value, s.currentFunction->getReturnType(), builder, "'ret'",
+            isUnsignedTypeName(s.currentFunctionReturnType.baseName));
+        if (value) builder->CreateRet(value);
+        return;
+    }
+
+    if (instruction == "store") {
+        llvm::Value* pointer = processValue(s, *command.values[0], builder);
+        llvm::Value* value = processValue(s, *command.values[1], builder);
+        if (!pointer || !value) return;
+        if (!pointer->getType()->isPointerTy() || value->getType()->isVoidTy()) {
+            psi::logError("'store' requires a pointer and a value");
+            return;
+        }
+        TypeNode pointerType;
+        if (command.values[0]->kind == ValueKind::Register
+            && resolveRegisterTypeNode(s, command.values[0]->registerValue, pointerType)) {
+            if (pointerType.pointerLevel < 1) {
+                psi::logError("'store' requires a pointer operand");
+                return;
+            }
+            --pointerType.pointerLevel;
+            TypeNode valueType;
+            if (command.values[1]->kind == ValueKind::Register
+                && resolveRegisterTypeNode(s, command.values[1]->registerValue, valueType)
+                && (valueType.baseName != pointerType.baseName
+                    || valueType.pointerLevel != pointerType.pointerLevel)) {
+                psi::logError("'store' value type must match the pointer's pointee type");
+                return;
+            }
+        }
+        builder->CreateStore(value, pointer);
+        return;
+    }
+
+    if (instruction == "jmp") {
+        const std::string& target = command.values[0]->registerValue.name;
+        auto label = s.labels.find(target);
+        if (label == s.labels.end()) {
+            psi::ErrorStream() << "jmp to undefined label '" << target << "'\n";
+            return;
+        }
+        builder->CreateBr(label->second);
+        return;
+    }
+
+    if (instruction == "cjmp") {
+        const std::string& target = command.values[1]->registerValue.name;
+        auto label = s.labels.find(target);
+        if (label == s.labels.end()) {
+            psi::ErrorStream() << "cjmp to undefined label '" << target << "'\n";
+            return;
+        }
+        llvm::Value* condition = processValue(s, *command.values[0], builder);
+        if (!condition) return;
+        if (condition->getType()->isIntegerTy() && !condition->getType()->isIntegerTy(1)) {
+            condition = builder->CreateICmpNE(condition, llvm::Constant::getNullValue(condition->getType()));
+        } else if (!condition->getType()->isIntegerTy(1)) {
+            psi::ErrorStream() << "'cjmp' needs an integer condition";
+            return;
+        }
+        auto* fallthrough = llvm::BasicBlock::Create(*s.context, "", s.currentFunction);
+        builder->CreateCondBr(condition, label->second, fallthrough);
+        builder->SetInsertPoint(fallthrough);
+        return;
+    }
+
+    if (instruction == "label") {
+        const std::string& name = command.values[0]->registerValue.name;
+        llvm::BasicBlock* block = s.labels.count(name)
+            ? s.labels[name]
+            : llvm::BasicBlock::Create(*s.context, name, s.currentFunction);
+        s.labels[name] = block;
+        if (!builder->GetInsertBlock()->getTerminator()) builder->CreateBr(block);
+        builder->SetInsertPoint(block);
+        return;
+    }
+
+    if (instruction == "call") processCallInstruction(s, command, builder);
+}
+
+void processLocalDeclaration(State& s, const CommandNode& command, llvm::IRBuilder<>* builder)
+{
+    llvm::Type* type = resolveType(s, command.declaredType);
+    if (!type) return;
+
+    const bool hasInitializer = command.hasInstruction || !command.values.empty();
+    llvm::Value* value = nullptr;
+    if (hasInitializer) {
+        value = computeCommandValue(s, command, builder, &command.declaredType);
+        if (!value) return;
+        value = coerceValue(value, type, builder, "declaration of '" + command.targetRegister.name + "'",
+            isUnsignedTypeName(command.declaredType.baseName));
+        if (!value) return;
+    }
+
+    const std::string& name = command.targetRegister.name;
+    auto existing = s.locals.find(name);
+    if (existing != s.locals.end()) {
+        if (hasInitializer) builder->CreateStore(value, existing->second);
+        return;
+    }
+
+    auto* slot = builder->CreateAlloca(type, nullptr, name);
+    if (command.declaredType.alignment > 0)
+        slot->setAlignment(llvm::Align(command.declaredType.alignment));
+    s.locals[name] = slot;
+    s.localTypes[name] = command.declaredType;
+    s.declaredLocalNames.push_back(name);
+    if (hasInitializer) builder->CreateStore(value, slot);
+}
+
+void processRegisterAssignment(State& s, const CommandNode& command, llvm::IRBuilder<>* builder)
+{
+    llvm::Value* value = computeCommandValue(s, command, builder, nullptr);
+    if (!value) return;
+
+    RegisterAddress access = resolveRegisterAddress(s, command.targetRegister, builder);
+    if (!access.address) return;
+    llvm::Type* targetType = resolveType(s, access.typeNode);
+    if (!targetType) return;
+    value = coerceValue(value, targetType, builder, "assignment to '" + command.targetRegister.name + "'",
+        isUnsignedTypeName(access.typeNode.baseName));
+    if (value) builder->CreateStore(value, access.address);
+}
+
+llvm::Value* processBinaryInstruction(State& s, const std::string& op,
+    const CommandNode& command, llvm::IRBuilder<>* builder)
+{
+    llvm::Value* lhs = !command.values.empty() ? processValue(s, *command.values[0], builder) : nullptr;
+    llvm::Value* rhs = command.values.size() > 1 ? processValue(s, *command.values[1], builder) : nullptr;
+    if (!lhs || !rhs) return nullptr;
+
+    const bool isUnsigned = isDeclaredUnsigned(s, *command.values[0]);
+    rhs = coerceValue(rhs, lhs->getType(), builder, "'" + op + "'", isUnsigned);
+    if (!rhs) return nullptr;
+
+    const bool isFloat = lhs->getType()->isFloatingPointTy();
+    const bool isInteger = lhs->getType()->isIntegerTy();
+    if (!isInteger && !isFloat) {
+        psi::logError("'" + op + "' requires scalar numeric operands");
+        return nullptr;
+    }
+    if (!isInteger && (op == "and" || op == "or" || op == "xor" || op == "lsh"
+        || op == "rsh" || op == "land" || op == "lor")) {
+        psi::logError("'" + op + "' requires integer operands");
+        return nullptr;
+    }
+
+    auto trapIf = [&](llvm::Value* condition) {
+        llvm::Function* function = builder->GetInsertBlock()->getParent();
+        llvm::BasicBlock* trapBlock = llvm::BasicBlock::Create(*s.context, "psi.trap", function);
+        llvm::BasicBlock* continueBlock = llvm::BasicBlock::Create(*s.context, "psi.cont", function);
+        builder->CreateCondBr(condition, trapBlock, continueBlock);
+        builder->SetInsertPoint(trapBlock);
+        llvm::Function* trap = llvm::Intrinsic::getDeclaration(
+            builder->GetInsertBlock()->getModule(), llvm::Intrinsic::trap);
+        builder->CreateCall(trap);
+        builder->CreateUnreachable();
+        builder->SetInsertPoint(continueBlock);
+    };
+
+    if (op == "add") return isFloat ? builder->CreateFAdd(lhs, rhs) : builder->CreateAdd(lhs, rhs);
+    if (op == "sub") return isFloat ? builder->CreateFSub(lhs, rhs) : builder->CreateSub(lhs, rhs);
+    if (op == "mul") return isFloat ? builder->CreateFMul(lhs, rhs) : builder->CreateMul(lhs, rhs);
+    if (op == "div") {
+        if (isFloat) return builder->CreateFDiv(lhs, rhs);
+        llvm::Value* invalid = builder->CreateICmpEQ(rhs,
+            llvm::ConstantInt::get(rhs->getType(), 0));
+        if (!isUnsigned) {
+            const unsigned width = lhs->getType()->getIntegerBitWidth();
+            const uint64_t minimumBits = uint64_t { 1 } << (width - 1);
+            llvm::Value* isMinimum = builder->CreateICmpEQ(lhs,
+                llvm::ConstantInt::get(lhs->getType(), minimumBits));
+            llvm::Value* isNegativeOne = builder->CreateICmpEQ(rhs,
+                llvm::ConstantInt::getAllOnesValue(rhs->getType()));
+            invalid = builder->CreateOr(invalid,
+                builder->CreateAnd(isMinimum, isNegativeOne));
+        }
+        trapIf(invalid);
+        return isUnsigned ? builder->CreateUDiv(lhs, rhs) : builder->CreateSDiv(lhs, rhs);
+    }
+    if (op == "mod") {
+        if (isFloat) return builder->CreateFRem(lhs, rhs);
+        llvm::Value* invalid = builder->CreateICmpEQ(rhs,
+            llvm::ConstantInt::get(rhs->getType(), 0));
+        if (!isUnsigned) {
+            const unsigned width = lhs->getType()->getIntegerBitWidth();
+            const uint64_t minimumBits = uint64_t { 1 } << (width - 1);
+            llvm::Value* isMinimum = builder->CreateICmpEQ(lhs,
+                llvm::ConstantInt::get(lhs->getType(), minimumBits));
+            llvm::Value* isNegativeOne = builder->CreateICmpEQ(rhs,
+                llvm::ConstantInt::getAllOnesValue(rhs->getType()));
+            invalid = builder->CreateOr(invalid,
+                builder->CreateAnd(isMinimum, isNegativeOne));
+        }
+        trapIf(invalid);
+        return isUnsigned ? builder->CreateURem(lhs, rhs) : builder->CreateSRem(lhs, rhs);
+    }
+    if (op == "eq") return isFloat ? builder->CreateFCmpOEQ(lhs, rhs) : builder->CreateICmpEQ(lhs, rhs);
+    if (op == "neq") return isFloat ? builder->CreateFCmpONE(lhs, rhs) : builder->CreateICmpNE(lhs, rhs);
+    if (op == "gt") {
+        if (isFloat) return builder->CreateFCmpOGT(lhs, rhs);
+        return isUnsigned ? builder->CreateICmpUGT(lhs, rhs) : builder->CreateICmpSGT(lhs, rhs);
+    }
+    if (op == "lt") {
+        if (isFloat) return builder->CreateFCmpOLT(lhs, rhs);
+        return isUnsigned ? builder->CreateICmpULT(lhs, rhs) : builder->CreateICmpSLT(lhs, rhs);
+    }
+    if (op == "gte") {
+        if (isFloat) return builder->CreateFCmpOGE(lhs, rhs);
+        return isUnsigned ? builder->CreateICmpUGE(lhs, rhs) : builder->CreateICmpSGE(lhs, rhs);
+    }
+    if (op == "lte") {
+        if (isFloat) return builder->CreateFCmpOLE(lhs, rhs);
+        return isUnsigned ? builder->CreateICmpULE(lhs, rhs) : builder->CreateICmpSLE(lhs, rhs);
+    }
+    if (op == "and") return builder->CreateAnd(lhs, rhs);
+    if (op == "or") return builder->CreateOr(lhs, rhs);
+    if (op == "xor") return builder->CreateXor(lhs, rhs);
+    if (op == "lsh" || op == "rsh") {
+        llvm::Value* tooLarge = builder->CreateICmpUGE(rhs,
+            llvm::ConstantInt::get(rhs->getType(), lhs->getType()->getIntegerBitWidth()));
+        trapIf(tooLarge);
+        if (op == "lsh") return builder->CreateShl(lhs, rhs);
+        return isUnsigned ? builder->CreateLShr(lhs, rhs) : builder->CreateAShr(lhs, rhs);
+    }
+    if (op == "land") {
+        auto* lhsIsTrue = builder->CreateICmpNE(lhs, llvm::Constant::getNullValue(lhs->getType()));
+        auto* rhsIsTrue = builder->CreateICmpNE(rhs, llvm::Constant::getNullValue(rhs->getType()));
+        return builder->CreateAnd(lhsIsTrue, rhsIsTrue);
+    }
+    if (op == "lor") {
+        auto* lhsIsTrue = builder->CreateICmpNE(lhs, llvm::Constant::getNullValue(lhs->getType()));
+        auto* rhsIsTrue = builder->CreateICmpNE(rhs, llvm::Constant::getNullValue(rhs->getType()));
+        return builder->CreateOr(lhsIsTrue, rhsIsTrue);
+    }
+
+    psi::ErrorStream() << "unsupported instruction '" << op << "'\n";
+    return nullptr;
+}
+
 } // namespace
 
-llvm::Value* computeCommandValue(State& s, CommandNode& command, llvm::IRBuilder<>* builder, const TypeNode* declaredType)
+llvm::Value* computeCommandValue(State& s, const CommandNode& command, llvm::IRBuilder<>* builder,
+    const TypeNode* declaredType)
 {
     if (command.hasInstruction) {
         if (command.instruction.isSpecial) {
@@ -860,6 +1190,21 @@ llvm::Value* computeCommandValue(State& s, CommandNode& command, llvm::IRBuilder
                 psi::logError("'load' requires a pointer operand");
                 return nullptr;
             }
+            TypeNode pointerType;
+            if (command.values[0]->kind == ValueKind::Register
+                && resolveRegisterTypeNode(s, command.values[0]->registerValue, pointerType)) {
+                TypeNode expectedType = *declaredType;
+                if (pointerType.pointerLevel < 1) {
+                    psi::logError("'load' requires a pointer operand");
+                    return nullptr;
+                }
+                --pointerType.pointerLevel;
+                if (pointerType.baseName != expectedType.baseName
+                    || pointerType.pointerLevel != expectedType.pointerLevel) {
+                    psi::logError("'load' result type must match the pointer's pointee type");
+                    return nullptr;
+                }
+            }
             return builder->CreateLoad(type, p);
         }
         if (op == "not") {
@@ -881,96 +1226,7 @@ llvm::Value* computeCommandValue(State& s, CommandNode& command, llvm::IRBuilder
             return builder->CreateICmpEQ(v, llvm::Constant::getNullValue(v->getType()));
         }
 
-        llvm::Value* lhs = (!command.values.empty()) ? processValue(s, *command.values[0], builder) : nullptr;
-        llvm::Value* rhs = (command.values.size() > 1) ? processValue(s, *command.values[1], builder) : nullptr;
-        if (!lhs || !rhs) {
-            return nullptr;
-        }
-
-        bool isUnsigned = isDeclaredUnsigned(s, *command.values[0]);
-        rhs = coerceValue(rhs, lhs->getType(), builder, "'" + op + "'", isUnsigned);
-        if (!rhs) {
-            return nullptr;
-        }
-
-        bool isFloat = lhs->getType()->isFloatingPointTy();
-
-        const bool integer = lhs->getType()->isIntegerTy();
-        if (!integer && !isFloat) {
-            psi::logError("'" + op + "' requires scalar numeric operands");
-            return nullptr;
-        }
-        if (!integer && (op == "and" || op == "or" || op == "xor" || op == "lsh"
-            || op == "rsh" || op == "land" || op == "lor")) {
-            psi::logError("'" + op + "' requires integer operands");
-            return nullptr;
-        }
-
-        if (op == "add")
-            return isFloat ? builder->CreateFAdd(lhs, rhs) : builder->CreateAdd(lhs, rhs);
-        if (op == "sub")
-            return isFloat ? builder->CreateFSub(lhs, rhs) : builder->CreateSub(lhs, rhs);
-        if (op == "mul")
-            return isFloat ? builder->CreateFMul(lhs, rhs) : builder->CreateMul(lhs, rhs);
-        if (op == "div") {
-            if (isFloat)
-                return builder->CreateFDiv(lhs, rhs);
-            return isUnsigned ? builder->CreateUDiv(lhs, rhs) : builder->CreateSDiv(lhs, rhs);
-        }
-        if (op == "mod") {
-            if (isFloat)
-                return builder->CreateFRem(lhs, rhs);
-            return isUnsigned ? builder->CreateURem(lhs, rhs) : builder->CreateSRem(lhs, rhs);
-        }
-        if (op == "eq")
-            return isFloat ? builder->CreateFCmpOEQ(lhs, rhs) : builder->CreateICmpEQ(lhs, rhs);
-        if (op == "neq")
-            return isFloat ? builder->CreateFCmpONE(lhs, rhs) : builder->CreateICmpNE(lhs, rhs);
-        if (op == "gt") {
-            if (isFloat)
-                return builder->CreateFCmpOGT(lhs, rhs);
-            return isUnsigned ? builder->CreateICmpUGT(lhs, rhs) : builder->CreateICmpSGT(lhs, rhs);
-        }
-        if (op == "lt") {
-            if (isFloat)
-                return builder->CreateFCmpOLT(lhs, rhs);
-            return isUnsigned ? builder->CreateICmpULT(lhs, rhs) : builder->CreateICmpSLT(lhs, rhs);
-        }
-        if (op == "gte") {
-            if (isFloat)
-                return builder->CreateFCmpOGE(lhs, rhs);
-            return isUnsigned ? builder->CreateICmpUGE(lhs, rhs) : builder->CreateICmpSGE(lhs, rhs);
-        }
-        if (op == "lte") {
-            if (isFloat)
-                return builder->CreateFCmpOLE(lhs, rhs);
-            return isUnsigned ? builder->CreateICmpULE(lhs, rhs) : builder->CreateICmpSLE(lhs, rhs);
-        }
-        if (op == "and")
-            return builder->CreateAnd(lhs, rhs);
-        if (op == "or")
-            return builder->CreateOr(lhs, rhs);
-        if (op == "xor")
-            return builder->CreateXor(lhs, rhs);
-        if (op == "lsh")
-            return builder->CreateShl(lhs, rhs);
-        if (op == "rsh") {
-
-            return isUnsigned ? builder->CreateLShr(lhs, rhs) : builder->CreateAShr(lhs, rhs);
-        }
-        if (op == "land") {
-            auto* a = builder->CreateICmpNE(lhs, llvm::Constant::getNullValue(lhs->getType()));
-            auto* b = builder->CreateICmpNE(rhs, llvm::Constant::getNullValue(rhs->getType()));
-            return builder->CreateAnd(a, b);
-        }
-        if (op == "lor") {
-            auto* a = builder->CreateICmpNE(lhs, llvm::Constant::getNullValue(lhs->getType()));
-            auto* b = builder->CreateICmpNE(rhs, llvm::Constant::getNullValue(rhs->getType()));
-            return builder->CreateOr(a, b);
-        }
-
-        psi::ErrorStream() << "unsupported instruction '" << op << "'\n";
-        return nullptr;
+        return processBinaryInstruction(s, op, command, builder);
     }
 
     if (declaredType && !command.values.empty() && command.values[0]->kind == ValueKind::Array) {
@@ -980,7 +1236,7 @@ llvm::Value* computeCommandValue(State& s, CommandNode& command, llvm::IRBuilder
     return processValue(s, *command.values[0], builder);
 }
 
-void processCommand(State& s, CommandNode command, llvm::IRBuilder<>* builder)
+void processCommand(State& s, const CommandNode& command, llvm::IRBuilder<>* builder)
 {
     if (command.isEmpty) {
         return;
@@ -996,151 +1252,17 @@ void processCommand(State& s, CommandNode command, llvm::IRBuilder<>* builder)
     }
 
     if (command.targetKind == TargetKind::None) {
-
-        if (command.hasInstruction) {
-            if (command.instruction.isSpecial) {
-                processSpecialInstruction(s, command, builder, nullptr);
-            } else {
-                if (command.instruction.name == "ret") {
-                    if (command.values.empty()) {
-                        builder->CreateRetVoid();
-                    } else {
-                        llvm::Value* retValue = processValue(s, *command.values[0], builder);
-                        if (!retValue) {
-                            return;
-                        }
-                        retValue = coerceValue(retValue, s.currentFunction->getReturnType(), builder, "'ret'",
-                            isUnsignedTypeName(s.currentFunctionReturnType.baseName));
-                        if (!retValue) {
-                            return;
-                        }
-                        builder->CreateRet(retValue);
-                    }
-                } else if (command.instruction.name == "store") {
-                    auto* pointer = processValue(s, *command.values[0], builder);
-                    auto* value = processValue(s, *command.values[1], builder);
-                    if (!pointer || !value) return;
-                    if (!pointer->getType()->isPointerTy() || value->getType()->isVoidTy()) {
-                        psi::logError("'store' requires a pointer and a value");
-                        return;
-                    }
-                    builder->CreateStore(value, pointer);
-                } else if (command.instruction.name == "jmp") {
-                    const std::string& target = command.values[0]->registerValue.name;
-                    auto it = s.labels.find(target);
-                    if (it == s.labels.end()) {
-                        psi::ErrorStream() << "jmp to undefined label '" << target << "'\n";
-                        return;
-                    }
-                    builder->CreateBr(it->second);
-                } else if (command.instruction.name == "cjmp") {
-                    const std::string& target = command.values[1]->registerValue.name;
-                    auto it = s.labels.find(target);
-                    if (it == s.labels.end()) {
-                        psi::ErrorStream() << "cjmp to undefined label '" << target << "'\n";
-                        return;
-                    }
-                    llvm::Value* condition = processValue(s, *command.values[0], builder);
-                    if (!condition) {
-                        return;
-                    }
-                    if (condition->getType()->isIntegerTy() && !condition->getType()->isIntegerTy(1)) {
-
-                        condition = builder->CreateICmpNE(condition, llvm::Constant::getNullValue(condition->getType()));
-                    } else if (!condition->getType()->isIntegerTy(1)) {
-                        psi::ErrorStream() << "'cjmp' needs an integer condition";
-                        return;
-                    }
-                    auto else_block = llvm::BasicBlock::Create(*s.context, "", s.currentFunction);
-                    builder->CreateCondBr(condition, it->second, else_block);
-                    builder->SetInsertPoint(else_block);
-                } else if (command.instruction.name == "label") {
-                    const std::string& labelName = command.values[0]->registerValue.name;
-
-                    llvm::BasicBlock* block = s.labels.count(labelName)
-                        ? s.labels[labelName]
-                        : llvm::BasicBlock::Create(*s.context, labelName, s.currentFunction);
-                    s.labels[labelName] = block;
-
-                    if (!builder->GetInsertBlock()->getTerminator()) {
-                        builder->CreateBr(block);
-                    }
-                    builder->SetInsertPoint(block);
-                } else if (command.instruction.name == "call") {
-
-                    processCallInstruction(s, command, builder);
-                }
-            }
+        if (!command.hasInstruction) return;
+        if (command.instruction.isSpecial) {
+            processSpecialInstruction(s, command, builder, nullptr);
+            return;
         }
-    } else if (command.targetKind == TargetKind::Register) {
-
-        if (command.hasDeclaredType) {
-
-            llvm::Type* reg_type = resolveType(s, command.declaredType);
-            if (!reg_type) {
-                return;
-            }
-
-            bool hasInitializer = command.hasInstruction || !command.values.empty();
-
-            llvm::Value* value = nullptr;
-            if (hasInitializer) {
-                value = computeCommandValue(s, command, builder, &command.declaredType);
-                if (!value) {
-                    return;
-                }
-                value = coerceValue(value, reg_type, builder, "declaration of '" + command.targetRegister.name + "'",
-                    isUnsignedTypeName(command.declaredType.baseName));
-                if (!value) {
-                    return;
-                }
-            }
-
-            const std::string& reg_name = command.targetRegister.name;
-
-            auto existing = s.locals.find(reg_name);
-            if (existing != s.locals.end()) {
-
-                if (hasInitializer) {
-                    builder->CreateStore(value, existing->second);
-                }
-                return;
-            }
-
-            auto reg = builder->CreateAlloca(reg_type, nullptr, reg_name);
-            if (command.declaredType.alignment > 0) {
-                reg->setAlignment(llvm::Align(command.declaredType.alignment));
-            }
-            s.locals[reg_name] = reg;
-            s.localTypes[reg_name] = command.declaredType;
-            s.declaredLocalNames.push_back(reg_name);
-
-            if (hasInitializer) {
-                builder->CreateStore(value, reg);
-            }
-        } else {
-
-            llvm::Value* value = computeCommandValue(s, command, builder, nullptr);
-            if (!value) {
-                return;
-            }
-
-            RegisterAddress access = resolveRegisterAddress(s, command.targetRegister, builder);
-            if (!access.address) {
-                return;
-            }
-            llvm::Type* targetType = resolveType(s, access.typeNode);
-            if (!targetType) {
-                return;
-            }
-            value = coerceValue(value, targetType, builder, "assignment to '" + command.targetRegister.name + "'",
-                isUnsignedTypeName(access.typeNode.baseName));
-            if (!value) {
-                return;
-            }
-            builder->CreateStore(value, access.address);
-        }
+        processUntargetedInstruction(s, command, builder);
+        return;
     }
+
+    if (command.hasDeclaredType) processLocalDeclaration(s, command, builder);
+    else processRegisterAssignment(s, command, builder);
 }
 
 void generateFunctionBody(State& s, const BlockNode& body, llvm::Function* function,
@@ -1174,7 +1296,7 @@ void generateFunctionBody(State& s, const BlockNode& body, llvm::Function* funct
 
     predeclareLabels(s, body.commands, function);
 
-    for (auto command : body.commands) {
+    for (const CommandNode& command : body.commands) {
         if (psi::hadErrors()) break;
         const bool isLabel = command.hasInstruction && !command.instruction.isSpecial
             && command.instruction.name == "label";

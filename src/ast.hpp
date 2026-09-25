@@ -145,6 +145,7 @@ struct DeclarationNode {
 
 struct ProgramNode {
     std::vector<DeclarationNode> declarations;
-    // Keep parsed values alive across AST copies without recursive ownership.
+    // Nodes refer to values by pointer; this arena owns them. Keeping ownership
+    // on the program lets AST copies used by lowering share the same values.
     std::vector<std::shared_ptr<ValueNode>> ownedValues;
 };

@@ -36,7 +36,7 @@ public:
 
 private:
     std::string source;
-    int position = 0;
+    std::size_t position = 0;
     int line = 1;
     int column = 1;
 
@@ -44,6 +44,7 @@ private:
     char currentChar();
     char lookAheadChar();
     char readChar();
+    Token makeToken(TokenType type, std::string text, int startLine, int startColumn) const;
 
     void skipWhitespaceAndComments();
 

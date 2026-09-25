@@ -22,6 +22,7 @@
 #include <llvm/TargetParser/Host.h>
 
 #include <memory>
+#include <mutex>
 #include <string>
 
 namespace psi_codegen {
@@ -51,8 +52,26 @@ void setCodegenDiagnosticHandler(llvm::LLVMContext& context)
     context.setDiagnosticHandlerCallBack(captureLLVMDiagnostic, nullptr, true);
 }
 
+namespace {
+
+void initializeAllTargetComponents()
+{
+    static std::once_flag initialized;
+    std::call_once(initialized, [] {
+        llvm::InitializeAllTargetInfos();
+        llvm::InitializeAllTargets();
+        llvm::InitializeAllTargetMCs();
+        llvm::InitializeAllAsmParsers();
+        llvm::InitializeAllAsmPrinters();
+    });
+}
+
+} // namespace
+
 std::unique_ptr<llvm::TargetMachine> buildTargetMachine(const std::string& triple, std::string& errorMessage)
 {
+    initializeAllTargetComponents();
+
     std::string lookupError;
     const llvm::Target* target = llvm::TargetRegistry::lookupTarget(triple, lookupError);
     if (!target) {
@@ -79,15 +98,6 @@ std::unique_ptr<llvm::TargetMachine> buildTargetMachine(const std::string& tripl
 
 namespace {
 
-void initializeAllTargetComponents()
-{
-    llvm::InitializeAllTargetInfos();
-    llvm::InitializeAllTargets();
-    llvm::InitializeAllTargetMCs();
-    llvm::InitializeAllAsmParsers();
-    llvm::InitializeAllAsmPrinters();
-}
-
 // Shared scaffolding for optimizeIR/compileToObjectMemory: parse IR text into
 // a fresh context with the diagnostic handler installed.
 std::unique_ptr<llvm::Module> parseIRModule(
@@ -108,6 +118,20 @@ std::unique_ptr<llvm::Module> parseIRModule(
         return nullptr;
     }
     return module;
+}
+
+std::unique_ptr<llvm::TargetMachine> prepareModuleTarget(
+    llvm::Module& module, std::string triple, std::string& errorMessage)
+{
+    if (triple.empty()) triple = module.getTargetTriple();
+    if (triple.empty()) triple = llvm::sys::getDefaultTargetTriple();
+
+    std::unique_ptr<llvm::TargetMachine> targetMachine = buildTargetMachine(triple, errorMessage);
+    if (!targetMachine) return nullptr;
+
+    module.setTargetTriple(triple);
+    module.setDataLayout(targetMachine->createDataLayout());
+    return targetMachine;
 }
 
 void runOptimizationPipeline(llvm::Module& module, llvm::TargetMachine* targetMachine, OptLevel level)
@@ -158,8 +182,6 @@ void runOptimizationPipeline(llvm::Module& module, llvm::TargetMachine* targetMa
 
 std::string optimizeIR(const std::string& irCode, OptLevel level, std::string& errorMessage)
 {
-    initializeAllTargetComponents();
-
     llvm::LLVMContext context;
     std::unique_ptr<llvm::Module> module = parseIRModule(irCode, context, errorMessage);
 
@@ -168,19 +190,10 @@ std::string optimizeIR(const std::string& irCode, OptLevel level, std::string& e
     }
 
     if (level != OptLevel::O0) {
-        std::string triple = module->getTargetTriple();
-        if (triple.empty()) {
-            triple = llvm::sys::getDefaultTargetTriple();
-        }
-
-        std::unique_ptr<llvm::TargetMachine> targetMachine = buildTargetMachine(triple, errorMessage);
+        std::unique_ptr<llvm::TargetMachine> targetMachine = prepareModuleTarget(*module, "", errorMessage);
         if (!targetMachine) {
             return "";
         }
-
-        module->setTargetTriple(triple);
-        module->setDataLayout(targetMachine->createDataLayout());
-
         runOptimizationPipeline(*module, targetMachine.get(), level);
     }
 
@@ -197,8 +210,6 @@ bool compileToObjectMemory(
     OptLevel level,
     std::string& errorMessage)
 {
-    initializeAllTargetComponents();
-
     llvm::LLVMContext context;
     std::unique_ptr<llvm::Module> module = parseIRModule(irCode, context, errorMessage);
 
@@ -206,21 +217,12 @@ bool compileToObjectMemory(
         return false;
     }
 
-    std::string triple = targetTriple;
-    if (triple.empty()) {
-        triple = module->getTargetTriple();
-    }
-    if (triple.empty()) {
-        triple = llvm::sys::getDefaultTargetTriple();
-    }
-
-    std::unique_ptr<llvm::TargetMachine> targetMachine = buildTargetMachine(triple, errorMessage);
+    std::unique_ptr<llvm::TargetMachine> targetMachine = prepareModuleTarget(*module, targetTriple, errorMessage);
     if (!targetMachine) {
         return false;
     }
 
-    module->setTargetTriple(triple);
-    module->setDataLayout(targetMachine->createDataLayout());
+    const std::string triple = module->getTargetTriple();
 
     runOptimizationPipeline(*module, targetMachine.get(), level);
 

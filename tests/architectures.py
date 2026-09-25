@@ -64,6 +64,9 @@ for arch in TARGETS:
     for opt in ['-O0', '-O2']:
         compile_source(arch, '#nop; u32 n = #clz 1; u32 p = #popcnt n;', options=[opt])
         compile_source(arch, 'f32 a = 1.0; f32 b = 2.0; f32 c = #fadd a b;', options=[opt])
+    compile_source(arch,
+        'func i32 core_ops i32 a i32 b { i32 q = div a b; i32 s = lsh a b; i32 sum = add q s; ret sum; }',
+        raw=True)
 
 INSTRUCTIONS = {
     'x86': ['pause', 'lfence', 'sfence', 'mfence'],

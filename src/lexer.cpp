@@ -1,5 +1,6 @@
 #include "lexer.hpp"
 #include <stdexcept>
+#include <utility>
 
 static bool isDigitChar(char c)
 {
@@ -22,16 +23,12 @@ static bool isLetterOrDigitChar(char c)
 }
 
 Lexer::Lexer(const std::string& sourceCode)
-{
-    source = sourceCode;
-    position = 0;
-    line = 1;
-    column = 1;
-}
+    : source(sourceCode)
+{}
 
 bool Lexer::isAtEnd()
 {
-    return position >= (int)source.size();
+    return position >= source.size();
 }
 
 char Lexer::currentChar()
@@ -44,33 +41,32 @@ char Lexer::currentChar()
 
 char Lexer::lookAheadChar()
 {
-    int nextPosition = position + 1;
-    if (nextPosition >= (int)source.size()) {
-        return '\0';
-    }
-    return source[nextPosition];
+    return position + 1 < source.size() ? source[position + 1] : '\0';
 }
 
 char Lexer::readChar()
 {
     char c = source[position];
-    position = position + 1;
+    ++position;
     if (c == '\n') {
-        line = line + 1;
+        ++line;
         column = 1;
     } else {
-        column = column + 1;
+        ++column;
     }
     return c;
+}
+
+Token Lexer::makeToken(TokenType type, std::string text, int startLine, int startColumn) const
+{
+    return {type, std::move(text), startLine, startColumn};
 }
 
 void Lexer::skipWhitespaceAndComments()
 {
     while (!isAtEnd()) {
         char c = currentChar();
-        bool isWhitespace = (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f');
-
-        if (isWhitespace) {
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f') {
             readChar();
             continue;
         }
@@ -109,106 +105,83 @@ void Lexer::skipWhitespaceAndComments()
 
 Token Lexer::readIdentifier()
 {
-    int startLine = line;
-    int startColumn = column;
+    const int startLine = line;
+    const int startColumn = column;
     std::string text;
 
     while (!isAtEnd() && isLetterOrDigitChar(currentChar())) {
-        text = text + readChar();
+        text += readChar();
     }
 
-    Token token;
-    token.type = TokenType::Identifier;
-    token.text = text;
-    token.line = startLine;
-    token.column = startColumn;
-    return token;
+    return makeToken(TokenType::Identifier, std::move(text), startLine, startColumn);
 }
 
 Token Lexer::readNumber()
 {
-
-    int startLine = line;
-    int startColumn = column;
+    const int startLine = line;
+    const int startColumn = column;
     std::string text;
 
     if (currentChar() == '-') {
-        text = text + readChar();
+        text += readChar();
     }
 
-    bool isHex = (currentChar() == '0' && (lookAheadChar() == 'x' || lookAheadChar() == 'X'));
-    if (isHex) {
-        text = text + readChar();
-        text = text + readChar();
+    if (currentChar() == '0' && (lookAheadChar() == 'x' || lookAheadChar() == 'X')) {
+        text += readChar();
+        text += readChar();
         if (!isHexDigitChar(currentChar()))
             throw std::runtime_error("expected hexadecimal digits at line " + std::to_string(startLine));
         while (!isAtEnd() && isHexDigitChar(currentChar())) {
-            text = text + readChar();
+            text += readChar();
         }
     } else {
         while (!isAtEnd() && isDigitChar(currentChar())) {
-            text = text + readChar();
+            text += readChar();
         }
         if (currentChar() == '.' && isDigitChar(lookAheadChar())) {
-            text = text + readChar();
+            text += readChar();
             while (!isAtEnd() && isDigitChar(currentChar())) {
-                text = text + readChar();
+                text += readChar();
             }
         }
     }
 
-    Token token;
-    token.type = TokenType::Number;
-    token.text = text;
-    token.line = startLine;
-    token.column = startColumn;
-    return token;
+    return makeToken(TokenType::Number, std::move(text), startLine, startColumn);
 }
 
 Token Lexer::readString()
 {
-
-    int startLine = line;
-    int startColumn = column;
+    const int startLine = line;
+    const int startColumn = column;
     std::string text;
-    text = text + readChar();
+    text += readChar();
+    bool escaped = false;
+    bool closed = false;
 
-    while (true) {
-        if (isAtEnd()) {
-            throw std::runtime_error("unterminated string literal starting at line " + std::to_string(startLine));
-        }
+    while (!isAtEnd()) {
         char c = readChar();
-        text = text + c;
+        text += c;
 
-        if (c == '"') {
-
-            int backslashCount = 0;
-            int i = (int)text.size() - 2;
-            while (i >= 0 && text[i] == '\\') {
-                backslashCount = backslashCount + 1;
-                i = i - 1;
-            }
-            bool quoteIsEscaped = (backslashCount % 2 == 1);
-            if (!quoteIsEscaped) {
-                break;
-            }
+        if (c == '"' && !escaped) {
+            closed = true;
+            break;
         }
+
+        escaped = c == '\\' && !escaped;
     }
 
-    Token token;
-    token.type = TokenType::String;
-    token.text = text;
-    token.line = startLine;
-    token.column = startColumn;
-    return token;
+    if (!closed)
+        throw std::runtime_error("unterminated string literal starting at line " + std::to_string(startLine));
+
+    return makeToken(TokenType::String, std::move(text), startLine, startColumn);
 }
 
 Token Lexer::readSpecialToken(char marker, TokenType type)
 {
-    int startLine = line;
-    int startColumn = column;
+    const int startLine = line;
+    const int startColumn = column;
     std::string text;
-    text = text + readChar();
+    text += readChar();
 
     if (!isLetterChar(currentChar())) {
         throw std::runtime_error(std::string("expected a name right after '") + marker + "' at line " + std::to_string(startLine));
@@ -223,12 +196,7 @@ Token Lexer::readSpecialToken(char marker, TokenType type)
         }
     }
 
-    Token token;
-    token.type = type;
-    token.text = text;
-    token.line = startLine;
-    token.column = startColumn;
-    return token;
+    return makeToken(type, std::move(text), startLine, startColumn);
 }
 
 std::vector<Token> Lexer::tokenize()
@@ -239,18 +207,13 @@ std::vector<Token> Lexer::tokenize()
         skipWhitespaceAndComments();
 
         if (isAtEnd()) {
-            Token endToken;
-            endToken.type = TokenType::EndOfFile;
-            endToken.text = "";
-            endToken.line = line;
-            endToken.column = column;
-            tokens.push_back(endToken);
+            tokens.push_back(makeToken(TokenType::EndOfFile, "", line, column));
             break;
         }
 
         char c = currentChar();
-        int startLine = line;
-        int startColumn = column;
+        const int startLine = line;
+        const int startColumn = column;
 
         if (isLetterChar(c)) {
             tokens.push_back(readIdentifier());
@@ -275,34 +238,40 @@ std::vector<Token> Lexer::tokenize()
         }
 
         readChar();
-        Token token;
-        token.text = std::string(1, c);
-        token.line = startLine;
-        token.column = startColumn;
-
-        if (c == '{') {
-            token.type = TokenType::LeftBrace;
-        } else if (c == '}') {
-            token.type = TokenType::RightBrace;
-        } else if (c == '[') {
-            token.type = TokenType::LeftBracket;
-        } else if (c == ']') {
-            token.type = TokenType::RightBracket;
-        } else if (c == '*') {
-            token.type = TokenType::Star;
-        } else if (c == '.') {
-            token.type = TokenType::Dot;
-        } else if (c == ':') {
-            token.type = TokenType::Colon;
-        } else if (c == '=') {
-            token.type = TokenType::Equals;
-        } else if (c == ';') {
-            token.type = TokenType::Semicolon;
-        } else {
+        TokenType type;
+        switch (c) {
+        case '{':
+            type = TokenType::LeftBrace;
+            break;
+        case '}':
+            type = TokenType::RightBrace;
+            break;
+        case '[':
+            type = TokenType::LeftBracket;
+            break;
+        case ']':
+            type = TokenType::RightBracket;
+            break;
+        case '*':
+            type = TokenType::Star;
+            break;
+        case '.':
+            type = TokenType::Dot;
+            break;
+        case ':':
+            type = TokenType::Colon;
+            break;
+        case '=':
+            type = TokenType::Equals;
+            break;
+        case ';':
+            type = TokenType::Semicolon;
+            break;
+        default:
             throw std::runtime_error(std::string("unexpected character '") + c + "' at line " + std::to_string(startLine));
         }
 
-        tokens.push_back(token);
+        tokens.push_back(makeToken(type, std::string(1, c), startLine, startColumn));
     }
 
     return tokens;

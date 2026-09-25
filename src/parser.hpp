@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <string>
 #include <vector>
 
@@ -8,22 +9,22 @@
 
 class Parser {
 public:
-    Parser(const std::vector<Token>& tokenList);
+    explicit Parser(std::vector<Token> tokenList);
 
     ProgramNode parseProgram();
 
 private:
     std::vector<Token> tokens;
-    int position = 0;
+    std::size_t position = 0;
     std::vector<std::shared_ptr<ValueNode>> ownedValues;
     ValueNode* makeValue();
 
-    Token currentToken();
-    Token lookAheadToken(int howManyAhead);
+    const Token& currentToken() const;
+    const Token& lookAheadToken(std::size_t howManyAhead) const;
     Token consumeToken();
-    bool checkTokenType(TokenType type);
-    bool checkTokenTypeAhead(TokenType type, int howManyAhead);
-    bool checkKeyword(const std::string& text);
+    bool checkTokenType(TokenType type) const;
+    bool checkTokenTypeAhead(TokenType type, std::size_t howManyAhead) const;
+    bool checkKeyword(const std::string& text) const;
     Token expectTokenType(TokenType type, const std::string& what);
     void raiseError(const std::string& message);
 

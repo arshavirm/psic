@@ -32,6 +32,190 @@ void addRegister(State& s, const std::string& name, RegisterWidth width)
     s.specialRegisters[name] = SpecialRegisterInfo { "{" + name + "}", width, "", "" };
 }
 
+template <std::size_t Size>
+void addRegisterAliases(State& s, const char* const (&names)[Size], RegisterWidth width)
+{
+    for (const char* name : names)
+        addRegister(s, name, width);
+}
+
+void addX86_64Registers(State& s)
+{
+    static const char* gpr64[] = {
+        "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+        "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"
+    };
+    static const char* gpr32[] = {
+        "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp",
+        "r8d", "r9d", "r10d", "r11d", "r12d", "r13d", "r14d", "r15d"
+    };
+    static const char* gpr16[] = {
+        "ax", "bx", "cx", "dx", "si", "di", "bp", "sp",
+        "r8w", "r9w", "r10w", "r11w", "r12w", "r13w", "r14w", "r15w"
+    };
+    static const char* gpr8[] = {
+        "al", "bl", "cl", "dl", "sil", "dil", "bpl", "spl",
+        "r8b", "r9b", "r10b", "r11b", "r12b", "r13b", "r14b", "r15b"
+    };
+    addRegisterAliases(s, gpr64, RegisterWidth::I64);
+    addRegisterAliases(s, gpr32, RegisterWidth::I32);
+    addRegisterAliases(s, gpr16, RegisterWidth::I16);
+    addRegisterAliases(s, gpr8, RegisterWidth::I8);
+    for (int i = 0; i < 16; ++i)
+        addRegister(s, "xmm" + std::to_string(i), RegisterWidth::F32);
+}
+
+void addX86Registers(State& s)
+{
+    static const char* gpr32[] = {"eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp"};
+    static const char* gpr16[] = {"ax", "bx", "cx", "dx", "si", "di", "bp", "sp"};
+    static const char* gpr8[] = {"al", "bl", "cl", "dl"};
+    addRegisterAliases(s, gpr32, RegisterWidth::I32);
+    addRegisterAliases(s, gpr16, RegisterWidth::I16);
+    addRegisterAliases(s, gpr8, RegisterWidth::I8);
+    for (int i = 0; i < 8; ++i)
+        addRegister(s, "xmm" + std::to_string(i), RegisterWidth::F32);
+}
+
+void addAArch64Registers(State& s)
+{
+    for (int i = 0; i < 31; ++i) {
+        addRegister(s, "x" + std::to_string(i), RegisterWidth::I64);
+        addRegister(s, "w" + std::to_string(i), RegisterWidth::I32);
+    }
+    for (int i = 0; i < 32; ++i) {
+        addRegister(s, "s" + std::to_string(i), RegisterWidth::F32);
+        addRegister(s, "d" + std::to_string(i), RegisterWidth::F64);
+    }
+    addRegister(s, "sp", RegisterWidth::I64);
+    addRegister(s, "fp", RegisterWidth::I64);
+    addRegister(s, "lr", RegisterWidth::I64);
+}
+
+void addARM32Registers(State& s)
+{
+    for (int i = 0; i < 13; ++i)
+        addRegister(s, "r" + std::to_string(i), RegisterWidth::I32);
+    addRegister(s, "sp", RegisterWidth::I32);
+    addRegister(s, "lr", RegisterWidth::I32);
+    addRegister(s, "fp", RegisterWidth::I32);
+    for (int i = 0; i < 32; ++i)
+        addRegister(s, "s" + std::to_string(i), RegisterWidth::F32);
+    for (int i = 0; i < 16; ++i)
+        addRegister(s, "d" + std::to_string(i), RegisterWidth::F64);
+}
+
+void addRISCVRegisters(State& s, Architecture arch)
+{
+    const auto width = arch == Architecture::RISCV64 ? RegisterWidth::I64 : RegisterWidth::I32;
+    static const char* aliases[] = {"zero", "ra", "sp", "gp", "tp", "t0", "t1", "t2",
+        "s0", "s1", "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7",
+        "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11", "t3", "t4", "t5", "t6"};
+    for (int i = 0; i < 32; ++i) {
+        const std::string name = "x" + std::to_string(i);
+        addRegister(s, name, width);
+        s.specialRegisters[aliases[i]] = s.specialRegisters[name];
+    }
+    s.specialRegisters["fp"] = s.specialRegisters["x8"];
+}
+
+void addPowerPCRegisters(State& s, Architecture arch)
+{
+    const RegisterWidth integerWidth = arch == Architecture::PPC32 ? RegisterWidth::I32 : RegisterWidth::I64;
+    for (int i = 0; i < 32; ++i) {
+        addRegister(s, "r" + std::to_string(i), integerWidth);
+        addRegister(s, "f" + std::to_string(i), RegisterWidth::F64);
+    }
+    s.specialRegisters["sp"] = s.specialRegisters["r1"];
+}
+
+void addMIPSRegisters(State& s, Architecture arch)
+{
+    const bool wide = arch == Architecture::MIPS64 || arch == Architecture::MIPS64EL;
+    static const char* aliases[] = {"zero", "at", "v0", "v1", "a0", "a1", "a2", "a3",
+        "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7", "s0", "s1", "s2", "s3",
+        "s4", "s5", "s6", "s7", "t8", "t9", "k0", "k1", "gp", "sp", "fp", "ra"};
+    for (int i = 0; i < 32; ++i) {
+        const std::string name = "r" + std::to_string(i);
+        s.specialRegisters[name] = {"{$" + std::to_string(i) + "}",
+            wide ? RegisterWidth::I64 : RegisterWidth::I32, "", ""};
+        if (!wide || i < 8 || i >= 16) s.specialRegisters[aliases[i]] = s.specialRegisters[name];
+    }
+    if (wide) {
+        for (int i = 4; i < 8; ++i)
+            s.specialRegisters["a" + std::to_string(i)] = s.specialRegisters["r" + std::to_string(i + 4)];
+        for (int i = 0; i < 4; ++i)
+            s.specialRegisters["t" + std::to_string(i)] = s.specialRegisters["r" + std::to_string(i + 12)];
+    }
+}
+
+void addLoongArchRegisters(State& s)
+{
+    for (int i = 0; i < 32; ++i)
+        addRegister(s, "r" + std::to_string(i), RegisterWidth::I64);
+    s.specialRegisters["zero"] = s.specialRegisters["r0"];
+    s.specialRegisters["ra"] = s.specialRegisters["r1"];
+    s.specialRegisters["tp"] = s.specialRegisters["r2"];
+    s.specialRegisters["sp"] = s.specialRegisters["r3"];
+    s.specialRegisters["fp"] = s.specialRegisters["r22"];
+    for (int i = 0; i < 8; ++i)
+        s.specialRegisters["a" + std::to_string(i)] = s.specialRegisters["r" + std::to_string(i + 4)];
+}
+
+void addSystemZRegisters(State& s)
+{
+    for (int i = 0; i < 16; ++i) {
+        addRegister(s, "r" + std::to_string(i), RegisterWidth::I64);
+        addRegister(s, "f" + std::to_string(i), RegisterWidth::F64);
+    }
+    s.specialRegisters["sp"] = s.specialRegisters["r15"];
+}
+
+void addSystemRegisters(State& s, Architecture arch)
+{
+    auto add = [&](const std::string& name, RegisterWidth width,
+                   const std::string& read, const std::string& write = "") {
+        s.specialRegisters[name] = {"r", width, read, write};
+    };
+    if (isAArch64(arch)) {
+        add("nzcv", RegisterWidth::I64, "mrs $0, NZCV", "msr NZCV, $0");
+        add("fpcr", RegisterWidth::I64, "mrs $0, FPCR", "msr FPCR, $0");
+        add("fpsr", RegisterWidth::I64, "mrs $0, FPSR", "msr FPSR, $0");
+        add("cntvct_el0", RegisterWidth::I64, "mrs $0, CNTVCT_EL0");
+        add("cntfrq_el0", RegisterWidth::I64, "mrs $0, CNTFRQ_EL0");
+        add("tpidr_el0", RegisterWidth::I64, "mrs $0, TPIDR_EL0", "msr TPIDR_EL0, $0");
+    }
+    if (isARM32(arch)) {
+        s.specialRegisters["r13"] = s.specialRegisters["sp"];
+        s.specialRegisters["r14"] = s.specialRegisters["lr"];
+        add("apsr", RegisterWidth::I32, "mrs $0, APSR", "msr APSR_nzcvq, $0");
+    }
+    if (arch == Architecture::RISCV32 || arch == Architecture::RISCV64) {
+        const auto width = arch == Architecture::RISCV64 ? RegisterWidth::I64 : RegisterWidth::I32;
+        add("cycle", width, "rdcycle $0");
+        add("time", width, "rdtime $0");
+        add("instret", width, "rdinstret $0");
+        if (arch == Architecture::RISCV32) {
+            add("cycleh", width, "rdcycleh $0");
+            add("timeh", width, "rdtimeh $0");
+            add("instreth", width, "rdinstreth $0");
+        }
+    }
+    if (arch == Architecture::PPC32 || arch == Architecture::PPC64 || arch == Architecture::PPC64LE) {
+        const auto width = arch == Architecture::PPC32 ? RegisterWidth::I32 : RegisterWidth::I64;
+        add("lr", width, "mflr $0", "mtlr $0");
+        add("ctr", width, "mfctr $0", "mtctr $0");
+        add("xer", width, "mfxer $0", "mtxer $0");
+    }
+    if (arch == Architecture::MIPS || arch == Architecture::MIPSEL
+        || arch == Architecture::MIPS64 || arch == Architecture::MIPS64EL) {
+        const auto width = arch == Architecture::MIPS64 || arch == Architecture::MIPS64EL
+            ? RegisterWidth::I64 : RegisterWidth::I32;
+        add("hi", width, "mfhi $0", "mthi $0");
+        add("lo", width, "mflo $0", "mtlo $0");
+    }
+}
+
 } // namespace
 
 void buildSpecialRegisterTable(State& s)
@@ -39,178 +223,22 @@ void buildSpecialRegisterTable(State& s)
     const Architecture arch = s.architecture;
     s.specialRegisters.clear();
 
-    if (arch == Architecture::X86_64) {
-        static const char* gpr64[] = {
-            "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
-            "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"
-        };
-        static const char* gpr32[] = {
-            "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp",
-            "r8d", "r9d", "r10d", "r11d", "r12d", "r13d", "r14d", "r15d"
-        };
-        static const char* gpr16[] = {
-            "ax", "bx", "cx", "dx", "si", "di", "bp", "sp",
-            "r8w", "r9w", "r10w", "r11w", "r12w", "r13w", "r14w", "r15w"
-        };
-        static const char* gpr8[] = {
-            "al", "bl", "cl", "dl", "sil", "dil", "bpl", "spl",
-            "r8b", "r9b", "r10b", "r11b", "r12b", "r13b", "r14b", "r15b"
-        };
-
-        for (auto name : gpr64)
-            addRegister(s, name, RegisterWidth::I64);
-        for (auto name : gpr32)
-            addRegister(s, name, RegisterWidth::I32);
-        for (auto name : gpr16)
-            addRegister(s, name, RegisterWidth::I16);
-        for (auto name : gpr8)
-            addRegister(s, name, RegisterWidth::I8);
-
-        for (int i = 0; i < 16; ++i)
-            addRegister(s, "xmm" + std::to_string(i), RegisterWidth::F32);
-    } else if (arch == Architecture::X86) {
-        static const char* gpr32[] = {
-            "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp"
-        };
-        static const char* gpr16[] = {
-            "ax", "bx", "cx", "dx", "si", "di", "bp", "sp"
-        };
-        static const char* gpr8[] = {
-            "al", "bl", "cl", "dl"
-        };
-
-        for (auto name : gpr32)
-            addRegister(s, name, RegisterWidth::I32);
-        for (auto name : gpr16)
-            addRegister(s, name, RegisterWidth::I16);
-        for (auto name : gpr8)
-            addRegister(s, name, RegisterWidth::I8);
-
-        for (int i = 0; i < 8; ++i)
-            addRegister(s, "xmm" + std::to_string(i), RegisterWidth::F32);
-    } else if (isAArch64(arch)) {
-        for (int i = 0; i < 31; ++i) {
-            addRegister(s, "x" + std::to_string(i), RegisterWidth::I64);
-            addRegister(s, "w" + std::to_string(i), RegisterWidth::I32);
-        }
-
-        for (int i = 0; i < 32; ++i) {
-            addRegister(s, "s" + std::to_string(i), RegisterWidth::F32);
-            addRegister(s, "d" + std::to_string(i), RegisterWidth::F64);
-        }
-
-        addRegister(s, "sp", RegisterWidth::I64);
-
-        addRegister(s, "fp", RegisterWidth::I64);
-        addRegister(s, "lr", RegisterWidth::I64);
-    } else if (isARM32(arch)) {
-        for (int i = 0; i < 13; ++i)
-            addRegister(s, "r" + std::to_string(i), RegisterWidth::I32);
-
-        addRegister(s, "sp", RegisterWidth::I32);
-        addRegister(s, "lr", RegisterWidth::I32);
-
-        addRegister(s, "fp", RegisterWidth::I32);
-
-        for (int i = 0; i < 32; ++i)
-            addRegister(s, "s" + std::to_string(i), RegisterWidth::F32);
-
-        for (int i = 0; i < 16; ++i)
-            addRegister(s, "d" + std::to_string(i), RegisterWidth::F64);
+    switch (arch) {
+    case Architecture::X86_64: addX86_64Registers(s); break;
+    case Architecture::X86: addX86Registers(s); break;
+    case Architecture::AArch64: addAArch64Registers(s); break;
+    case Architecture::ARM: addARM32Registers(s); break;
+    default: break;
     }
-    if (arch == Architecture::RISCV32 || arch == Architecture::RISCV64) {
-        auto width = arch == Architecture::RISCV64 ? RegisterWidth::I64 : RegisterWidth::I32;
-        static const char* aliases[] = {"zero", "ra", "sp", "gp", "tp", "t0", "t1", "t2",
-            "s0", "s1", "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7",
-            "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11", "t3", "t4", "t5", "t6"};
-        for (int i = 0; i < 32; ++i) {
-            std::string name = "x" + std::to_string(i);
-            addRegister(s, name, width);
-            s.specialRegisters[aliases[i]] = s.specialRegisters[name];
-        }
-        s.specialRegisters["fp"] = s.specialRegisters["x8"];
-    }
-    if (arch == Architecture::PPC32 || arch == Architecture::PPC64 || arch == Architecture::PPC64LE) {
-        for (int i = 0; i < 32; ++i) {
-            addRegister(s, "r" + std::to_string(i), arch == Architecture::PPC32 ? RegisterWidth::I32 : RegisterWidth::I64);
-            addRegister(s, "f" + std::to_string(i), RegisterWidth::F64);
-        }
-        s.specialRegisters["sp"] = s.specialRegisters["r1"];
-    }
+    if (arch == Architecture::RISCV32 || arch == Architecture::RISCV64) addRISCVRegisters(s, arch);
+    if (arch == Architecture::PPC32 || arch == Architecture::PPC64 || arch == Architecture::PPC64LE)
+        addPowerPCRegisters(s, arch);
     if (arch == Architecture::MIPS || arch == Architecture::MIPSEL
-        || arch == Architecture::MIPS64 || arch == Architecture::MIPS64EL) {
-        const bool wide = arch == Architecture::MIPS64 || arch == Architecture::MIPS64EL;
-        static const char* aliases[] = {"zero", "at", "v0", "v1", "a0", "a1", "a2", "a3",
-            "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7", "s0", "s1", "s2", "s3",
-            "s4", "s5", "s6", "s7", "t8", "t9", "k0", "k1", "gp", "sp", "fp", "ra"};
-        for (int i = 0; i < 32; ++i) {
-            std::string name = "r" + std::to_string(i);
-            s.specialRegisters[name] = {"{$" + std::to_string(i) + "}", wide ? RegisterWidth::I64 : RegisterWidth::I32, "", ""};
-            if (!wide || i < 8 || i >= 16) s.specialRegisters[aliases[i]] = s.specialRegisters[name];
-        }
-        if (wide) {
-            for (int i = 4; i < 8; ++i) s.specialRegisters["a" + std::to_string(i)] = s.specialRegisters["r" + std::to_string(i + 4)];
-            for (int i = 0; i < 4; ++i) s.specialRegisters["t" + std::to_string(i)] = s.specialRegisters["r" + std::to_string(i + 12)];
-        }
-    }
-    if (arch == Architecture::LoongArch64) {
-        for (int i = 0; i < 32; ++i) addRegister(s, "r" + std::to_string(i), RegisterWidth::I64);
-        s.specialRegisters["zero"] = s.specialRegisters["r0"];
-        s.specialRegisters["ra"] = s.specialRegisters["r1"];
-        s.specialRegisters["tp"] = s.specialRegisters["r2"];
-        s.specialRegisters["sp"] = s.specialRegisters["r3"];
-        s.specialRegisters["fp"] = s.specialRegisters["r22"];
-        for (int i = 0; i < 8; ++i) s.specialRegisters["a" + std::to_string(i)] = s.specialRegisters["r" + std::to_string(i + 4)];
-    }
-    if (arch == Architecture::SystemZ) {
-        for (int i = 0; i < 16; ++i) {
-            addRegister(s, "r" + std::to_string(i), RegisterWidth::I64);
-            addRegister(s, "f" + std::to_string(i), RegisterWidth::F64);
-        }
-        s.specialRegisters["sp"] = s.specialRegisters["r15"];
-    }
-
-    auto systemRegister = [&](const std::string& name, RegisterWidth width,
-                              const std::string& read, const std::string& write = "") {
-        s.specialRegisters[name] = {"r", width, read, write};
-    };
-    if (isAArch64(arch)) {
-        systemRegister("nzcv", RegisterWidth::I64, "mrs $0, NZCV", "msr NZCV, $0");
-        systemRegister("fpcr", RegisterWidth::I64, "mrs $0, FPCR", "msr FPCR, $0");
-        systemRegister("fpsr", RegisterWidth::I64, "mrs $0, FPSR", "msr FPSR, $0");
-        systemRegister("cntvct_el0", RegisterWidth::I64, "mrs $0, CNTVCT_EL0");
-        systemRegister("cntfrq_el0", RegisterWidth::I64, "mrs $0, CNTFRQ_EL0");
-        systemRegister("tpidr_el0", RegisterWidth::I64, "mrs $0, TPIDR_EL0", "msr TPIDR_EL0, $0");
-    }
-    if (isARM32(arch)) {
-        s.specialRegisters["r13"] = s.specialRegisters["sp"];
-        s.specialRegisters["r14"] = s.specialRegisters["lr"];
-        systemRegister("apsr", RegisterWidth::I32, "mrs $0, APSR", "msr APSR_nzcvq, $0");
-    }
-    if (arch == Architecture::RISCV32 || arch == Architecture::RISCV64) {
-        auto width = arch == Architecture::RISCV64 ? RegisterWidth::I64 : RegisterWidth::I32;
-        systemRegister("cycle", width, "rdcycle $0");
-        systemRegister("time", width, "rdtime $0");
-        systemRegister("instret", width, "rdinstret $0");
-        if (arch == Architecture::RISCV32) {
-            systemRegister("cycleh", width, "rdcycleh $0");
-            systemRegister("timeh", width, "rdtimeh $0");
-            systemRegister("instreth", width, "rdinstreth $0");
-        }
-    }
-    if (arch == Architecture::PPC32 || arch == Architecture::PPC64 || arch == Architecture::PPC64LE) {
-        auto width = arch == Architecture::PPC32 ? RegisterWidth::I32 : RegisterWidth::I64;
-        systemRegister("lr", width, "mflr $0", "mtlr $0");
-        systemRegister("ctr", width, "mfctr $0", "mtctr $0");
-        systemRegister("xer", width, "mfxer $0", "mtxer $0");
-    }
-    if (arch == Architecture::MIPS || arch == Architecture::MIPSEL
-        || arch == Architecture::MIPS64 || arch == Architecture::MIPS64EL) {
-        auto width = arch == Architecture::MIPS64 || arch == Architecture::MIPS64EL ? RegisterWidth::I64 : RegisterWidth::I32;
-        systemRegister("hi", width, "mfhi $0", "mthi $0");
-        systemRegister("lo", width, "mflo $0", "mtlo $0");
-    }
-
+        || arch == Architecture::MIPS64 || arch == Architecture::MIPS64EL)
+        addMIPSRegisters(s, arch);
+    if (arch == Architecture::LoongArch64) addLoongArchRegisters(s);
+    if (arch == Architecture::SystemZ) addSystemZRegisters(s);
+    addSystemRegisters(s, arch);
 }
 
 llvm::Value* wasmMemorySize(State& s, llvm::IRBuilder<>* builder)

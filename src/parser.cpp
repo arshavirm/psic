@@ -1,22 +1,27 @@
 #include "parser.hpp"
+#include <algorithm>
+#include <array>
 #include <stdexcept>
+#include <string_view>
+#include <utility>
 
-Parser::Parser(const std::vector<Token>& tokenList)
+static bool isHexDigitChar(char c)
 {
-    tokens = tokenList;
-    position = 0;
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
 }
 
-Token Parser::lookAheadToken(int howManyAhead)
+Parser::Parser(std::vector<Token> tokenList)
+    : tokens(std::move(tokenList))
+{}
+
+const Token& Parser::lookAheadToken(std::size_t howManyAhead) const
 {
-    int index = position + howManyAhead;
-    if (index >= (int)tokens.size()) {
-        return tokens[tokens.size() - 1];
-    }
+    const std::size_t index = position + howManyAhead;
+    if (index >= tokens.size()) return tokens.back();
     return tokens[index];
 }
 
-Token Parser::currentToken()
+const Token& Parser::currentToken() const
 {
     return lookAheadToken(0);
 }
@@ -24,25 +29,23 @@ Token Parser::currentToken()
 Token Parser::consumeToken()
 {
     Token token = currentToken();
-    if (position + 1 < (int)tokens.size()) {
-        position = position + 1;
-    }
+    if (position + 1 < tokens.size()) ++position;
     return token;
 }
 
-bool Parser::checkTokenType(TokenType type)
+bool Parser::checkTokenType(TokenType type) const
 {
     return currentToken().type == type;
 }
 
-bool Parser::checkTokenTypeAhead(TokenType type, int howManyAhead)
+bool Parser::checkTokenTypeAhead(TokenType type, std::size_t howManyAhead) const
 {
     return lookAheadToken(howManyAhead).type == type;
 }
 
-bool Parser::checkKeyword(const std::string& text)
+bool Parser::checkKeyword(const std::string& text) const
 {
-    Token token = currentToken();
+    const Token& token = currentToken();
     return token.type == TokenType::Identifier && token.text == text;
 }
 
@@ -72,66 +75,20 @@ void Parser::raiseError(const std::string& message)
 
 bool Parser::isInstructionKeyword(const std::string& text)
 {
-    std::vector<std::string> instructionNames = {
-        "add",
-        "sub",
-        "mul",
-        "div",
-        "mod",
-        "eq",
-        "gt",
-        "lt",
-        "neq",
-        "gte",
-        "lte",
-        "and",
-        "or",
-        "not",
-        "xor",
-        "lsh",
-        "rsh",
-        "land",
-        "lor",
-        "lnot",
-        "ref",
-        "load",
-        "store",
-        "jmp",
-        "cjmp",
-        "call",
-        "ret",
-        "label",
+    static constexpr std::array<std::string_view, 28> instructionNames = {
+        "add", "sub", "mul", "div", "mod", "eq", "gt", "lt", "neq", "gte",
+        "lte", "and", "or", "not", "xor", "lsh", "rsh", "land", "lor", "lnot",
+        "ref", "load", "store", "jmp", "cjmp", "call", "ret", "label"
     };
-    for (int i = 0; i < (int)instructionNames.size(); i++) {
-        if (instructionNames[i] == text) {
-            return true;
-        }
-    }
-    return false;
+    return std::find(instructionNames.begin(), instructionNames.end(), text) != instructionNames.end();
 }
 
 bool Parser::isPrimitiveTypeName(const std::string& text)
 {
-    std::vector<std::string> primitiveNames = {
-        "void",
-        "bool",
-        "i8",
-        "i16",
-        "i32",
-        "i64",
-        "u8",
-        "u16",
-        "u32",
-        "u64",
-        "f32",
-        "f64",
+    static constexpr std::array<std::string_view, 12> primitiveNames = {
+        "void", "bool", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "f32", "f64"
     };
-    for (int i = 0; i < (int)primitiveNames.size(); i++) {
-        if (primitiveNames[i] == text) {
-            return true;
-        }
-    }
-    return false;
+    return std::find(primitiveNames.begin(), primitiveNames.end(), text) != primitiveNames.end();
 }
 
 bool Parser::tokenStartsInstruction(const Token& token)
@@ -152,17 +109,15 @@ int Parser::expectIndexNumber(const std::string& what)
     bool isHex = token.text.size() > 2 && token.text[0] == '0' && (token.text[1] == 'x' || token.text[1] == 'X');
 
     if (isHex) {
-        for (size_t i = 2; i < token.text.size(); i++) {
-            char c = token.text[i];
-            bool isHexDigit = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
-            if (!isHexDigit) {
+        for (std::size_t i = 2; i < token.text.size(); i++) {
+            if (!isHexDigitChar(token.text[i])) {
                 raiseError(what + " must be a plain whole number (no '-' or '.')");
             }
         }
         return std::stoi(token.text, nullptr, 16);
     }
 
-    for (int i = 0; i < (int)token.text.size(); i++) {
+    for (std::size_t i = 0; i < token.text.size(); i++) {
         char c = token.text[i];
         if (c < '0' || c > '9') {
             raiseError(what + " must be a plain whole number (no '-' or '.')");
@@ -243,11 +198,6 @@ InstNode Parser::parseInstruction()
     return inst;
 }
 
-static bool isHexDigitChar(char c)
-{
-    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
-}
-
 static int hexDigitValue(char c)
 {
     if (c >= '0' && c <= '9')
@@ -261,7 +211,7 @@ std::string Parser::decodeStringEscapes(const std::string& rawText)
 {
     std::string inner = rawText.substr(1, rawText.size() - 2);
     std::string result;
-    size_t i = 0;
+    std::size_t i = 0;
 
     while (i < inner.size()) {
         if (inner[i] != '\\') {
@@ -328,7 +278,7 @@ ValueNode* Parser::parseValue()
         ValueNode* value = makeValue();
         value->kind = ValueKind::Number;
 
-        size_t hexPrefixPos = (!token.text.empty() && token.text[0] == '-') ? 1 : 0;
+        std::size_t hexPrefixPos = (!token.text.empty() && token.text[0] == '-') ? 1 : 0;
         bool isHex = token.text.size() > hexPrefixPos + 1
             && token.text[hexPrefixPos] == '0'
             && (token.text[hexPrefixPos + 1] == 'x' || token.text[hexPrefixPos + 1] == 'X');
@@ -408,57 +358,43 @@ CommandNode Parser::parseCommand()
         return command;
     }
 
+    const bool startsInstruction = tokenStartsInstruction(currentToken());
     if (checkTokenType(TokenType::SpecialRegister)) {
         Token token = consumeToken();
         command.targetKind = TargetKind::SpecialRegister;
         command.targetSpecialRegister.name = token.text.substr(1);
+    } else if (!startsInstruction && checkTokenType(TokenType::Identifier)) {
+        const bool startsDeclaration = checkTokenTypeAhead(TokenType::Identifier, 1)
+            || checkTokenTypeAhead(TokenType::Star, 1) || checkTokenTypeAhead(TokenType::Colon, 1);
+        const bool startsAssignment = checkTokenTypeAhead(TokenType::Equals, 1)
+            || checkTokenTypeAhead(TokenType::LeftBracket, 1) || checkTokenTypeAhead(TokenType::Dot, 1);
 
-    } else if (tokenStartsInstruction(currentToken())) {
-
-    } else if (checkTokenType(TokenType::Identifier)) {
-
-        bool typeHasStarOrAlignment = checkTokenTypeAhead(TokenType::Star, 1) || checkTokenTypeAhead(TokenType::Colon, 1);
-        bool looksLikeTypeThenRegister = checkTokenTypeAhead(TokenType::Identifier, 1);
-        bool looksLikePlainAssignment = checkTokenTypeAhead(TokenType::Equals, 1);
-        bool looksLikeAccessorAssignment = checkTokenTypeAhead(TokenType::LeftBracket, 1) || checkTokenTypeAhead(TokenType::Dot, 1);
-
-        if (typeHasStarOrAlignment || looksLikeTypeThenRegister) {
+        if (startsDeclaration) {
             command.hasDeclaredType = true;
             command.declaredType = parseType();
             command.targetKind = TargetKind::Register;
             command.targetRegister = parseRegister();
-
-        } else if (looksLikePlainAssignment) {
+        } else if (startsAssignment) {
             if (isReservedWord(currentToken().text)) {
                 raiseError("'" + currentToken().text + "' is a reserved word and can't be used as a name");
             }
-            Token nameToken = consumeToken();
-            command.targetKind = TargetKind::Register;
-            command.targetRegister.name = nameToken.text;
-
-        } else if (looksLikeAccessorAssignment) {
             command.targetKind = TargetKind::Register;
             command.targetRegister = parseRegister();
-
         } else {
             raiseError("unexpected token after identifier in a command");
         }
-
-    } else {
+    } else if (!startsInstruction) {
         raiseError("unexpected token at the start of a command");
     }
 
-    bool needsValue = true;
-    if (command.targetKind != TargetKind::None) {
-        if (command.hasDeclaredType && checkTokenType(TokenType::Semicolon)) {
-
-            needsValue = false;
-        } else {
-            expectTokenType(TokenType::Equals, "'='");
-        }
+    const bool hasTarget = command.targetKind != TargetKind::None;
+    const bool declarationWithoutInitializer = command.hasDeclaredType
+        && checkTokenType(TokenType::Semicolon);
+    if (hasTarget && !declarationWithoutInitializer) {
+        expectTokenType(TokenType::Equals, "'='");
     }
 
-    if (needsValue) {
+    if (!declarationWithoutInitializer) {
         if (tokenStartsInstruction(currentToken())) {
             command.hasInstruction = true;
             command.instruction = parseInstruction();
@@ -466,7 +402,6 @@ CommandNode Parser::parseCommand()
                 command.values.push_back(parseValue());
             }
         } else if (!checkTokenType(TokenType::Semicolon)) {
-
             command.values.push_back(parseValue());
         }
     }

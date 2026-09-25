@@ -7,7 +7,6 @@ namespace psi {
 namespace {
     thread_local bool verboseEnabled = false;
     thread_local int errors = 0;
-    thread_local int warnings = 0;
     thread_local std::vector<psic::Diagnostic>* diagnosticSink = nullptr;
 
     std::string stripTrailingNewline(std::string message)
@@ -16,6 +15,19 @@ namespace {
             message.pop_back();
         }
         return message;
+    }
+
+    void emitDiagnostic(psic::DiagnosticSeverity severity, const std::string& message)
+    {
+        if (diagnosticSink) {
+            diagnosticSink->push_back({severity, message});
+            return;
+        }
+
+        const char* label = "note";
+        if (severity == psic::DiagnosticSeverity::Error) label = "error";
+        else if (severity == psic::DiagnosticSeverity::Warning) label = "warning";
+        std::cerr << "psic: " << label << ": " << message << "\n";
     }
 }
 
@@ -34,30 +46,17 @@ void setVerbose(bool enabled)
 void logError(const std::string& message)
 {
     errors++;
-    if (diagnosticSink) {
-        diagnosticSink->push_back({psic::DiagnosticSeverity::Error, message});
-        return;
-    }
-    std::cerr << "psic: error: " << message << "\n";
+    emitDiagnostic(psic::DiagnosticSeverity::Error, message);
 }
 
 void logWarning(const std::string& message)
 {
-    warnings++;
-    if (diagnosticSink) {
-        diagnosticSink->push_back({psic::DiagnosticSeverity::Warning, message});
-        return;
-    }
-    std::cerr << "psic: warning: " << message << "\n";
+    emitDiagnostic(psic::DiagnosticSeverity::Warning, message);
 }
 
 void logNote(const std::string& message)
 {
-    if (diagnosticSink) {
-        diagnosticSink->push_back({psic::DiagnosticSeverity::Note, message});
-        return;
-    }
-    std::cerr << "psic: note: " << message << "\n";
+    emitDiagnostic(psic::DiagnosticSeverity::Note, message);
 }
 
 void logInfo(const std::string& message)
@@ -80,7 +79,6 @@ int errorCount()
 void resetErrors()
 {
     errors = 0;
-    warnings = 0;
 }
 
 DiagnosticStream::~DiagnosticStream()

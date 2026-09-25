@@ -45,7 +45,6 @@ struct State {
     TypeNode currentFunctionReturnType;
 
     std::unordered_map<std::string, llvm::Type*> llvmTypes;
-    std::unordered_map<std::string, llvm::FunctionType*> functionTypes;
     std::unordered_map<std::string, llvm::Function*> functionDeclarations;
     std::unordered_map<std::string, std::vector<TypeNode>> functionParamTypes;
     std::unordered_map<std::string, TypeNode> functionReturnTypes;
@@ -76,7 +75,7 @@ inline bool isWasm(const State& s)
 llvm::Type* resolveType(State& s, const TypeNode& type);
 bool isUnsignedTypeName(const std::string& baseName);
 std::string defaultTriple(Architecture arch, OperatingSystem os);
-llvm::Constant* buildConstant(State& s, ValueNode* value, const TypeNode& declaredType, llvm::Module& module);
+llvm::Constant* buildConstant(State& s, const ValueNode* value, const TypeNode& declaredType, llvm::Module& module);
 
 struct RegisterAddress {
     llvm::Value* address = nullptr;
@@ -94,12 +93,12 @@ llvm::Value* processSpecialRegisterRead(State& s, const SpecialRegNode& reg, llv
 void processSpecialRegisterWrite(State& s, const SpecialRegNode& reg, llvm::Value* value, llvm::IRBuilder<>* builder);
 
 // --- codegen_instructions.cpp ---
-llvm::Value* processValue(State& s, ValueNode value, llvm::IRBuilder<>* builder);
+llvm::Value* processValue(State& s, const ValueNode& value, llvm::IRBuilder<>* builder);
 llvm::Value* coerceValue(llvm::Value* value, llvm::Type* targetType, llvm::IRBuilder<>* builder,
     const std::string& context, bool treatSourceAsUnsigned = false);
-llvm::Value* computeCommandValue(State& s, CommandNode& command, llvm::IRBuilder<>* builder,
+llvm::Value* computeCommandValue(State& s, const CommandNode& command, llvm::IRBuilder<>* builder,
     const TypeNode* declaredType);
-void processCommand(State& s, CommandNode command, llvm::IRBuilder<>* builder);
+void processCommand(State& s, const CommandNode& command, llvm::IRBuilder<>* builder);
 void generateFunctionBody(State& s, const BlockNode& body, llvm::Function* function,
     const std::vector<ArgNode>* args, const std::string& diagnosticName);
 

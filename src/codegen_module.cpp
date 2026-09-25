@@ -9,6 +9,7 @@
 #include <llvm/Target/TargetMachine.h>
 
 #include <stdexcept>
+#include <utility>
 
 namespace psi_codegen {
 
@@ -45,51 +46,47 @@ llvm::Constant* buildStringConstant(State& s, llvm::Module& module, const std::s
 
 } // namespace
 
-llvm::Constant* buildConstant(State& s, ValueNode* value, const TypeNode& declaredType, llvm::Module& module)
+llvm::Constant* buildConstant(State& s, const ValueNode* value, const TypeNode& declaredType, llvm::Module& module)
 {
     llvm::Type* targetType = resolveType(s, declaredType);
     if (!targetType || !value) {
         return nullptr;
     }
 
-    if (value->kind == ValueKind::Number) {
+    switch (value->kind) {
+    case ValueKind::Number: {
         if (targetType->isFloatingPointTy()) {
-            double d = value->numberIsFloat ? value->numberAsFloat : (double)value->numberAsInt;
-            return llvm::ConstantFP::get(targetType, d);
+            const double number = value->numberIsFloat
+                ? value->numberAsFloat : static_cast<double>(value->numberAsInt);
+            return llvm::ConstantFP::get(targetType, number);
         }
         if (!targetType->isIntegerTy()) {
             psi::logError("numeric global initializer requires an integer or floating type");
             return nullptr;
         }
-        long long i = value->numberIsFloat ? (long long)value->numberAsFloat : value->numberAsInt;
-        return llvm::ConstantInt::get(targetType, (uint64_t)i, true);
+        const long long integer = value->numberIsFloat
+            ? static_cast<long long>(value->numberAsFloat) : value->numberAsInt;
+        return llvm::ConstantInt::get(targetType, static_cast<uint64_t>(integer), true);
     }
-
-    if (value->kind == ValueKind::String) {
+    case ValueKind::String:
         if (!targetType->isPointerTy()) {
             psi::logError("string initializer requires a pointer type");
             return nullptr;
         }
         return buildStringConstant(s, module, value->stringValue);
-    }
-
-    if (value->kind == ValueKind::Bool) {
+    case ValueKind::Bool:
         if (!targetType->isIntegerTy()) {
             psi::ErrorStream() << "a bool literal needs an integer (e.g. bool/i8/i32) type\n";
             return nullptr;
         }
         return llvm::ConstantInt::get(targetType, value->boolValue ? 1 : 0);
-    }
-
-    if (value->kind == ValueKind::Null) {
+    case ValueKind::Null:
         if (declaredType.pointerLevel < 1) {
             psi::ErrorStream() << "'null' needs a pointer type, e.g. " << declaredType.baseName << "*\n";
             return nullptr;
         }
         return llvm::ConstantPointerNull::get(llvm::PointerType::get(*s.context, 0));
-    }
-
-    if (value->kind == ValueKind::Array) {
+    case ValueKind::Array: {
         if (declaredType.pointerLevel < 1) {
             psi::ErrorStream() << "array initializer for '" << declaredType.baseName
                                << "' needs a pointer type, e.g. " << declaredType.baseName << "*\n";
@@ -118,6 +115,10 @@ llvm::Constant* buildConstant(State& s, ValueNode* value, const TypeNode& declar
             llvm::GlobalValue::PrivateLinkage, arrayConstant, ".arr");
 
         return global;
+    }
+    case ValueKind::Register:
+    case ValueKind::SpecialRegister:
+        break;
     }
 
     psi::ErrorStream() << "unsupported initializer kind for a global/const value\n";
@@ -167,6 +168,15 @@ bool stepAccessorTypeNode(const State& s, const RegNode& reg, TypeNode& currentT
     return true;
 }
 
+const TypeNode* findRegisterType(const State& state, const std::string& name)
+{
+    auto local = state.localTypes.find(name);
+    if (local != state.localTypes.end()) return &local->second;
+
+    auto global = state.globalTypes.find(name);
+    return global == state.globalTypes.end() ? nullptr : &global->second;
+}
+
 } // namespace
 
 RegisterAddress resolveRegisterAddress(State& s, const RegNode& reg, llvm::IRBuilder<>* builder)
@@ -179,17 +189,22 @@ RegisterAddress resolveRegisterAddress(State& s, const RegNode& reg, llvm::IRBui
     auto localIt = s.locals.find(reg.name);
     if (localIt != s.locals.end()) {
         address = localIt->second;
-        currentType = s.localTypes[reg.name];
     } else {
         auto globIt = s.globals.find(reg.name);
         if (globIt != s.globals.end()) {
             address = globIt->second;
-            currentType = s.globalTypes[reg.name];
         } else {
             psi::ErrorStream() << "use of undeclared register '" << reg.name << "'\n";
             return result;
         }
     }
+
+    const TypeNode* registerType = findRegisterType(s, reg.name);
+    if (!registerType) {
+        psi::ErrorStream() << "use of undeclared register '" << reg.name << "'\n";
+        return result;
+    }
+    currentType = *registerType;
 
     for (const auto& accessor : reg.accessors) {
         const TypeNode typeBefore = currentType;
@@ -227,19 +242,9 @@ RegisterAddress resolveRegisterAddress(State& s, const RegNode& reg, llvm::IRBui
 
 bool resolveRegisterTypeNode(const State& s, const RegNode& reg, TypeNode& outType)
 {
-    TypeNode currentType;
-
-    auto localIt = s.localTypes.find(reg.name);
-    if (localIt != s.localTypes.end()) {
-        currentType = localIt->second;
-    } else {
-        auto globIt = s.globalTypes.find(reg.name);
-        if (globIt != s.globalTypes.end()) {
-            currentType = globIt->second;
-        } else {
-            return false;
-        }
-    }
+    const TypeNode* registerType = findRegisterType(s, reg.name);
+    if (!registerType) return false;
+    TypeNode currentType = *registerType;
 
     for (const auto& accessor : reg.accessors) {
         if (!stepAccessorTypeNode(s, reg, currentType, accessor, false)) {
@@ -354,6 +359,161 @@ std::string defaultTriple(Architecture arch, OperatingSystem os)
     throw std::runtime_error("unsupported architecture/OS combination");
 }
 
+namespace {
+
+void declareBuiltinTypes(State& state, llvm::LLVMContext& context)
+{
+    auto addType = [&state](const char* name, llvm::Type* type) {
+        state.llvmTypes[name] = type;
+    };
+
+    addType("void", llvm::Type::getVoidTy(context));
+    addType("bool", llvm::Type::getInt1Ty(context));
+
+    llvm::Type* i8 = llvm::Type::getInt8Ty(context);
+    llvm::Type* i16 = llvm::Type::getInt16Ty(context);
+    llvm::Type* i32 = llvm::Type::getInt32Ty(context);
+    llvm::Type* i64 = llvm::Type::getInt64Ty(context);
+    llvm::Type* f32 = llvm::Type::getFloatTy(context);
+    llvm::Type* f64 = llvm::Type::getDoubleTy(context);
+
+    addType("i8", i8);
+    addType("u8", i8);
+    addType("i16", i16);
+    addType("u16", i16);
+    addType("i32", i32);
+    addType("u32", i32);
+    addType("i64", i64);
+    addType("u64", i64);
+    addType("f32", f32);
+    addType("f64", f64);
+
+    addType("i8x16", llvm::FixedVectorType::get(i8, 16));
+    addType("i16x8", llvm::FixedVectorType::get(i16, 8));
+    addType("i32x4", llvm::FixedVectorType::get(i32, 4));
+    addType("i64x2", llvm::FixedVectorType::get(i64, 2));
+    addType("f32x4", llvm::FixedVectorType::get(f32, 4));
+    addType("f64x2", llvm::FixedVectorType::get(f64, 2));
+    addType("i32x8", llvm::FixedVectorType::get(i32, 8));
+    addType("i64x4", llvm::FixedVectorType::get(i64, 4));
+    addType("f32x8", llvm::FixedVectorType::get(f32, 8));
+    addType("f64x4", llvm::FixedVectorType::get(f64, 4));
+}
+
+void declareStructTypes(State& state, const ProgramNode& program, llvm::LLVMContext& context)
+{
+    for (const auto& declaration : program.declarations) {
+        if (declaration.kind != DeclKind::Struct) continue;
+        const std::string& name = declaration.structDecl.type.baseName;
+        if (!state.llvmTypes.count(name))
+            state.llvmTypes[name] = llvm::StructType::create(context, name);
+    }
+
+    for (const auto& declaration : program.declarations) {
+        if (declaration.kind != DeclKind::Struct) continue;
+        const auto& structure = declaration.structDecl;
+        const std::string& name = structure.type.baseName;
+        auto* llvmStructure = llvm::cast<llvm::StructType>(state.llvmTypes[name]);
+        if (!llvmStructure->isOpaque()) continue;
+
+        std::vector<llvm::Type*> fieldTypes;
+        std::vector<TypeNode> fieldTypeNodes;
+        std::unordered_map<std::string, int> fieldIndexes;
+        for (const auto& field : structure.fields) {
+            llvm::Type* fieldType = resolveType(state, field.type);
+            fieldTypes.push_back(fieldType ? fieldType : llvm::Type::getInt8Ty(context));
+            fieldTypeNodes.push_back(field.type);
+            fieldIndexes[field.name] = static_cast<int>(fieldIndexes.size());
+        }
+
+        llvmStructure->setBody(fieldTypes);
+        state.structFieldTypes[name] = std::move(fieldTypeNodes);
+        state.structFieldIndex[name] = std::move(fieldIndexes);
+    }
+}
+
+void declareFunctionsAndGlobals(State& state, const ProgramNode& program,
+    llvm::LLVMContext& context, llvm::Module& module)
+{
+    for (const auto& declaration : program.declarations) {
+        if (declaration.kind == DeclKind::Func) {
+            const auto& function = declaration.funcDecl;
+            if (state.functionDeclarations.count(function.name)) continue;
+
+            std::vector<llvm::Type*> argumentTypes;
+            std::vector<TypeNode> parameterTypes;
+            for (const auto& argument : function.args) {
+                llvm::Type* argumentType = resolveType(state, argument.type);
+                argumentTypes.push_back(argumentType ? argumentType : llvm::Type::getInt32Ty(context));
+                parameterTypes.push_back(argument.type);
+            }
+
+            llvm::Type* returnType = resolveType(state, function.returnType);
+            if (!returnType) returnType = llvm::Type::getVoidTy(context);
+
+            auto* functionType = llvm::FunctionType::get(returnType, argumentTypes, false);
+            state.functionParamTypes[function.name] = std::move(parameterTypes);
+            state.functionReturnTypes[function.name] = function.returnType;
+
+            auto* llvmFunction = llvm::Function::Create(functionType,
+                llvm::Function::ExternalLinkage, function.name, module);
+            std::size_t argumentIndex = 0;
+            for (auto& llvmArgument : llvmFunction->args())
+                llvmArgument.setName(function.args[argumentIndex++].name);
+            state.functionDeclarations[function.name] = llvmFunction;
+            continue;
+        }
+
+        if (declaration.kind != DeclKind::Glob && declaration.kind != DeclKind::Const)
+            continue;
+
+        const bool isConstant = declaration.kind == DeclKind::Const;
+        const TypeNode& type = isConstant ? declaration.constDecl.type : declaration.globDecl.type;
+        const std::string& name = isConstant ? declaration.constDecl.name : declaration.globDecl.name;
+        const ValueNode* value = isConstant ? declaration.constDecl.value : declaration.globDecl.value;
+
+        llvm::Type* llvmType = resolveType(state, type);
+        if (!llvmType) continue;
+        llvm::Constant* initializer = buildConstant(state, value, type, module);
+        if (!initializer) {
+            psi::ErrorStream() << "could not build initializer for '" << name << "'\n";
+            continue;
+        }
+
+        auto* global = new llvm::GlobalVariable(module, llvmType, isConstant,
+            llvm::GlobalValue::ExternalLinkage, initializer, name);
+        state.globals[name] = global;
+        state.globalTypes[name] = type;
+    }
+}
+
+void generateProgramBodies(State& state, const ProgramNode& program, llvm::Module& module)
+{
+    for (const auto& declaration : program.declarations) {
+        if (declaration.kind == DeclKind::Entry) {
+            const std::string& entryName = declaration.entryDecl.name;
+            if (state.functionDeclarations.count(entryName)) {
+                psi::ErrorStream() << "'" << entryName
+                                   << "' is already declared as a func - entry needs its own name";
+                continue;
+            }
+
+            auto* functionType = llvm::FunctionType::get(state.llvmTypes["void"], {}, false);
+            auto* function = llvm::Function::Create(functionType,
+                llvm::Function::ExternalLinkage, entryName, module);
+            generateFunctionBody(state, declaration.entryDecl.body, function, nullptr, entryName);
+            continue;
+        }
+
+        if (declaration.kind != DeclKind::Func || !declaration.funcDecl.hasBody) continue;
+        llvm::Function* function = state.functionDeclarations[declaration.funcDecl.name];
+        generateFunctionBody(state, declaration.funcDecl.body, function,
+            &declaration.funcDecl.args, declaration.funcDecl.name);
+    }
+}
+
+} // namespace
+
 std::string compileProgram(std::string name, ProgramNode program, Architecture arch, OperatingSystem os, const std::string& targetTriple)
 {
     psi::resetErrors();
@@ -369,163 +529,15 @@ std::string compileProgram(std::string name, ProgramNode program, Architecture a
     llvm::Module module(name, context);
     const std::string defaultTarget = defaultTriple(arch, os);
     module.setTargetTriple(targetTriple.empty() ? defaultTarget : targetTriple);
-    llvm::InitializeAllTargetInfos();
-    llvm::InitializeAllTargets();
-    llvm::InitializeAllTargetMCs();
     std::string targetError;
     auto targetMachine = buildTargetMachine(module.getTargetTriple(), targetError);
     if (!targetMachine) throw std::runtime_error(targetError);
     module.setDataLayout(targetMachine->createDataLayout());
 
-    s.llvmTypes.clear();
-    s.llvmTypes["void"] = llvm::Type::getVoidTy(context);
-    s.llvmTypes["bool"] = llvm::Type::getInt1Ty(context);
-    s.llvmTypes["i8"] = llvm::Type::getInt8Ty(context);
-    s.llvmTypes["u8"] = llvm::Type::getInt8Ty(context);
-    s.llvmTypes["i16"] = llvm::Type::getInt16Ty(context);
-    s.llvmTypes["u16"] = llvm::Type::getInt16Ty(context);
-    s.llvmTypes["i32"] = llvm::Type::getInt32Ty(context);
-    s.llvmTypes["u32"] = llvm::Type::getInt32Ty(context);
-    s.llvmTypes["i64"] = llvm::Type::getInt64Ty(context);
-    s.llvmTypes["u64"] = llvm::Type::getInt64Ty(context);
-    s.llvmTypes["f32"] = llvm::Type::getFloatTy(context);
-    s.llvmTypes["f64"] = llvm::Type::getDoubleTy(context);
-
-    s.llvmTypes["i8x16"] = llvm::FixedVectorType::get(llvm::Type::getInt8Ty(context), 16);
-    s.llvmTypes["i16x8"] = llvm::FixedVectorType::get(llvm::Type::getInt16Ty(context), 8);
-    s.llvmTypes["i32x4"] = llvm::FixedVectorType::get(llvm::Type::getInt32Ty(context), 4);
-    s.llvmTypes["i64x2"] = llvm::FixedVectorType::get(llvm::Type::getInt64Ty(context), 2);
-    s.llvmTypes["f32x4"] = llvm::FixedVectorType::get(llvm::Type::getFloatTy(context), 4);
-    s.llvmTypes["f64x2"] = llvm::FixedVectorType::get(llvm::Type::getDoubleTy(context), 2);
-
-    s.llvmTypes["i32x8"] = llvm::FixedVectorType::get(llvm::Type::getInt32Ty(context), 8);
-    s.llvmTypes["i64x4"] = llvm::FixedVectorType::get(llvm::Type::getInt64Ty(context), 4);
-    s.llvmTypes["f32x8"] = llvm::FixedVectorType::get(llvm::Type::getFloatTy(context), 8);
-    s.llvmTypes["f64x4"] = llvm::FixedVectorType::get(llvm::Type::getDoubleTy(context), 4);
-
-    s.functionTypes.clear();
-    s.functionDeclarations.clear();
-    s.functionParamTypes.clear();
-    s.functionReturnTypes.clear();
-    s.globals.clear();
-    s.globalTypes.clear();
-    s.structFieldIndex.clear();
-    s.structFieldTypes.clear();
-
-    for (auto& dec : program.declarations) {
-        if (dec.kind == DeclKind::Struct) {
-            const std::string& structName = dec.structDecl.type.baseName;
-            if (!s.llvmTypes.count(structName)) {
-                s.llvmTypes[structName] = llvm::StructType::create(context, structName);
-            }
-        }
-    }
-
-    for (auto& dec : program.declarations) {
-        if (dec.kind == DeclKind::Struct) {
-            const std::string& structName = dec.structDecl.type.baseName;
-            auto* structType = llvm::cast<llvm::StructType>(s.llvmTypes[structName]);
-            if (!structType->isOpaque()) {
-                continue;
-            }
-
-            std::vector<llvm::Type*> fieldLlvmTypes;
-            std::vector<TypeNode> fieldTypeNodes;
-            std::unordered_map<std::string, int> fieldIndex;
-
-            int idx = 0;
-            for (auto& field : dec.structDecl.fields) {
-                llvm::Type* fieldType = resolveType(s, field.type);
-                fieldLlvmTypes.push_back(fieldType ? fieldType : llvm::Type::getInt8Ty(context));
-                fieldTypeNodes.push_back(field.type);
-                fieldIndex[field.name] = idx;
-                idx++;
-            }
-
-            structType->setBody(fieldLlvmTypes);
-            s.structFieldTypes[structName] = fieldTypeNodes;
-            s.structFieldIndex[structName] = fieldIndex;
-        }
-    }
-
-    for (auto& dec : program.declarations) {
-        if (dec.kind == DeclKind::Func) {
-            if (s.functionDeclarations.count(dec.funcDecl.name)) {
-
-                continue;
-            }
-
-            std::vector<llvm::Type*> argTypes;
-            for (auto& arg : dec.funcDecl.args) {
-                llvm::Type* argType = resolveType(s, arg.type);
-                argTypes.push_back(argType ? argType : llvm::Type::getInt32Ty(context));
-            }
-            llvm::Type* retType = resolveType(s, dec.funcDecl.returnType);
-            if (!retType) {
-                retType = llvm::Type::getVoidTy(context);
-            }
-
-            auto* fnType = llvm::FunctionType::get(retType, argTypes, false);
-            s.functionTypes[dec.funcDecl.name] = fnType;
-
-            std::vector<TypeNode> paramTypes;
-            for (auto& arg : dec.funcDecl.args) {
-                paramTypes.push_back(arg.type);
-            }
-            s.functionParamTypes[dec.funcDecl.name] = paramTypes;
-            s.functionReturnTypes[dec.funcDecl.name] = dec.funcDecl.returnType;
-
-            auto* fn = llvm::Function::Create(fnType, llvm::Function::ExternalLinkage, dec.funcDecl.name, module);
-            size_t idx = 0;
-            for (auto& arg : fn->args()) {
-                arg.setName(dec.funcDecl.args[idx++].name);
-            }
-            s.functionDeclarations[dec.funcDecl.name] = fn;
-        } else if (dec.kind == DeclKind::Glob || dec.kind == DeclKind::Const) {
-            bool isConst = dec.kind == DeclKind::Const;
-            const TypeNode& type = isConst ? dec.constDecl.type : dec.globDecl.type;
-            const std::string& gname = isConst ? dec.constDecl.name : dec.globDecl.name;
-            ValueNode* val = isConst ? dec.constDecl.value : dec.globDecl.value;
-
-            llvm::Type* llvmType = resolveType(s, type);
-            if (!llvmType) {
-                continue;
-            }
-            llvm::Constant* init = buildConstant(s, val, type, module);
-            if (!init) {
-                psi::ErrorStream() << "could not build initializer for '" << gname << "'\n";
-                continue;
-            }
-
-            auto* global = new llvm::GlobalVariable(
-                module, llvmType, isConst, llvm::GlobalValue::ExternalLinkage, init, gname);
-            s.globals[gname] = global;
-            s.globalTypes[gname] = type;
-        }
-    }
-
-    for (auto& dec : program.declarations) {
-        if (dec.kind == DeclKind::Entry) {
-            const std::string& entryName = dec.entryDecl.name;
-
-            if (s.functionDeclarations.count(entryName)) {
-                psi::ErrorStream() << "'" << entryName
-                                   << "' is already declared as a func - entry needs its own name";
-                continue;
-            }
-
-            llvm::FunctionType* entry_function_type = llvm::FunctionType::get(s.llvmTypes["void"], { }, false);
-            llvm::Function* entry_function = llvm::Function::Create(
-                entry_function_type, llvm::Function::ExternalLinkage, entryName, module);
-
-            generateFunctionBody(s, dec.entryDecl.body, entry_function, nullptr, entryName);
-        } else if (dec.kind == DeclKind::Func) {
-            llvm::Function* fn = s.functionDeclarations[dec.funcDecl.name];
-            if (dec.funcDecl.hasBody) {
-                generateFunctionBody(s, dec.funcDecl.body, fn, &dec.funcDecl.args, dec.funcDecl.name);
-            }
-        }
-    }
+    declareBuiltinTypes(s, context);
+    declareStructTypes(s, program, context);
+    declareFunctionsAndGlobals(s, program, context, module);
+    generateProgramBodies(s, program, module);
 
     // Preserve baseline ISA requirements when users pass emitted IR to LLVM tools.
     for (auto& function : module) {

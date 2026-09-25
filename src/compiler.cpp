@@ -11,6 +11,46 @@
 namespace psic {
 namespace {
 std::mutex compilationMutex;
+
+struct TargetConfig {
+    Architecture architecture;
+    OperatingSystem operatingSystem;
+};
+
+void validateOptions(const CompileOptions& options)
+{
+    switch (options.optimization) {
+    case OptimizationLevel::O0: case OptimizationLevel::O1: case OptimizationLevel::O2:
+    case OptimizationLevel::O3: case OptimizationLevel::Os: case OptimizationLevel::Oz:
+        break;
+    default:
+        throw std::runtime_error("invalid optimization level");
+    }
+    if (options.output != OutputKind::LLVMIR && options.output != OutputKind::Object)
+        throw std::runtime_error("invalid output kind");
+}
+
+TargetConfig resolveTarget(const CompileOptions& options)
+{
+    TargetConfig target {
+        pickArchitecture(options.architecture, options.targetTriple),
+        pickOperatingSystem(options.operatingSystem, options.targetTriple),
+    };
+    const bool hasExplicitOs = !options.operatingSystem.empty();
+    const bool hasTriple = !options.targetTriple.empty();
+    const bool isWasm = target.architecture == Architecture::WASM32
+        || target.architecture == Architecture::WASM64;
+
+    if (!hasExplicitOs && !hasTriple && isWasm)
+        target.operatingSystem = OperatingSystem::FreeStanding;
+    if (hasExplicitOs && hasTriple
+        && target.operatingSystem != pickOperatingSystem("", options.targetTriple))
+        throw std::runtime_error("OS conflicts with target triple");
+    return target;
+}
+
+// The logger uses thread-local ambient state. Scope its sink to one public
+// compile call, then restore the prior sink for the surrounding caller.
 struct DiagnosticScope {
     std::vector<Diagnostic>* previous;
     explicit DiagnosticScope(std::vector<Diagnostic>& diagnostics)
@@ -21,31 +61,20 @@ struct DiagnosticScope {
 
 CompileResult compile(const std::string& source, const CompileOptions& options)
 {
+    // LLVM target initialization is shared across calls, so compilation is serialized.
     std::lock_guard<std::mutex> lock(compilationMutex);
     CompileResult result;
     DiagnosticScope diagnosticScope(result.diagnostics);
     try {
-        switch (options.optimization) {
-        case OptimizationLevel::O0: case OptimizationLevel::O1: case OptimizationLevel::O2:
-        case OptimizationLevel::O3: case OptimizationLevel::Os: case OptimizationLevel::Oz: break;
-        default: throw std::runtime_error("invalid optimization level");
-        }
-        if (options.output != OutputKind::LLVMIR && options.output != OutputKind::Object)
-            throw std::runtime_error("invalid output kind");
-        Architecture arch = pickArchitecture(options.architecture, options.targetTriple);
-        OperatingSystem os = pickOperatingSystem(options.operatingSystem, options.targetTriple);
-        if (options.operatingSystem.empty() && options.targetTriple.empty()
-            && (arch == Architecture::WASM32 || arch == Architecture::WASM64))
-            os = OperatingSystem::FreeStanding;
-        if (!options.operatingSystem.empty() && !options.targetTriple.empty()
-            && os != pickOperatingSystem("", options.targetTriple))
-            throw std::runtime_error("OS conflicts with target triple");
+        validateOptions(options);
+        const TargetConfig target = resolveTarget(options);
 
         Lexer lexer(source);
         Parser parser(lexer.tokenize());
         ProgramNode program = parser.parseProgram();
         validateProgram(program);
-        std::string ir = psi_codegen::compileProgram(options.moduleName, program, arch, os, options.targetTriple);
+        std::string ir = psi_codegen::compileProgram(options.moduleName, program,
+            target.architecture, target.operatingSystem, options.targetTriple);
         if (psi::hadErrors()) return result;
         std::string error;
         if (options.output == OutputKind::LLVMIR) {

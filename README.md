@@ -3,6 +3,55 @@
 PSIC compiles PSI unified assembly to LLVM IR or a relocatable object file.
 It requires C++17 and LLVM 18 or newer, with the desired target backends built in.
 
+## How compilation works
+
+The compiler has two entry points: the `psic` command-line program and the
+`psic::compile` C++ library API. The CLI handles arguments and file I/O; the
+library compiles source in memory and returns output plus structured diagnostics.
+
+For the detailed front-end, lowering, ownership, and output flow, see the
+[compiler design note](docs/compiler-design.md).
+
+Every compile follows this path:
+
+1. **Choose a target.** Explicit architecture and OS names are normalized, or
+   inferred from a target triple. Conflicting settings and unsupported targets
+   become diagnostics before parsing.
+2. **Tokenize and parse.** `src/lexer.cpp` turns source text into tokens with
+   line/column locations. `src/parser.cpp` builds the program AST in `src/ast.hpp`.
+   The program owns parsed values in an arena because AST nodes refer to them by
+   pointer; this keeps values alive while AST declarations are copied for lowering.
+3. **Validate.** `src/validation.cpp` checks declarations, types, command operands,
+   labels, and by-value struct cycles before LLVM IR is built.
+4. **Lower to LLVM IR.** `src/codegen_module.cpp` creates types, declarations,
+   globals, and function bodies. `src/codegen_instructions.cpp` lowers values and
+   commands; `src/codegen_registers.cpp` handles target-specific registers and
+   inline assembly. These stages share per-compilation LLVM and symbol state from
+   `src/codegen_state.hpp`.
+5. **Optimize or emit an object.** `src/codegen.cpp` parses the generated IR,
+   applies the selected LLVM optimization pipeline, and either returns optimized
+   IR text or emits target-specific object bytes.
+
+Diagnostics flow through `src/logging.cpp`. The library temporarily directs them
+into `CompileResult::diagnostics` and restores the previous logger afterward.
+The logger's sink and error count are thread-local; compilation calls are
+serialized around the compiler core. LLVM target components are registered once
+before target-machine construction. The CLI then writes the requested output file;
+file handling is not part of the library API.
+
+### Where to look
+
+| Concern | Source |
+| --- | --- |
+| Public embedding API and result types | `include/psic/compiler.hpp` |
+| CLI options, input and output files | `src/main.cpp` |
+| Architecture and OS selection | `src/target.cpp` |
+| Tokens and lexical rules | `src/lexer.hpp`, `src/lexer.cpp` |
+| Grammar and AST construction | `src/parser.hpp`, `src/parser.cpp`, `src/ast.hpp` |
+| Pre-codegen checks | `src/validation.cpp` |
+| LLVM lowering | `src/codegen_module.cpp`, `src/codegen_instructions.cpp`, `src/codegen_registers.cpp` |
+| Optimization and object emission | `src/codegen.cpp` |
+
 ```sh
 cmake -S . -B build -DLLVM_DIR=/path/to/llvm/lib/cmake/llvm
 cmake --build build
@@ -82,10 +131,14 @@ Allocation failures can propagate as C++ exceptions; ordinary source/target erro
 are returned as diagnostics.
 
 Repeated calls own and release their parser data. Calls from multiple threads are
-safe but currently serialized around the compiler core. The public API does not
-expose the core's mutable AST or LLVM state.
+safe but currently serialized around the compiler core. The logger's diagnostic
+sink is thread-local and scoped to each call. The public API does not expose the
+core's mutable AST or LLVM state.
 
 ## Compiler checks
+
+For details on what each CTest target covers, test prerequisites, and CMake test
+options, see the [testing guide](docs/testing.md).
 
 CTest covers:
 
@@ -155,6 +208,75 @@ memory64-capable linker/runtime. Selecting WASI does not supply a WASI sysroot.
 PSI values are named virtual registers. Architecture-specific or low-level
 operations use `#`; physical/special register accesses use `%`. Operands are
 separated by spaces and commands end in semicolons.
+
+### Program structure
+
+A source file contains declarations. A function declaration starts with `func`,
+then its return type and name, followed by zero or more type/name argument pairs.
+End a declaration with `;` to declare an external function; add a block to define
+the function. An `entry` declaration defines a named void function. Struct fields
+and function arguments are written as adjacent type/name pairs, without commas.
+Globals and constants have an initializer:
+
+```text
+struct Pair { i32 left i32 right }
+func i32 add_pair i32 a i32 b {
+    i32 sum = add a b;
+    ret sum;
+}
+func i32 host_value;
+i32 shared = 7;
+const i32 answer = 42;
+entry main {
+    i32 value = call add_pair shared answer;
+    ret;
+}
+```
+
+Types are primitive names such as `i32`, `u64`, `f32`, `bool`, and `void`, or a
+declared struct name. Append `*` for each pointer level; an optional `:N` after
+the type sets alignment (N must be a positive power of two). A command may
+declare a typed local (`i32 value;`), assign a value (`value = 4;`), or assign an
+instruction result (`i32 sum = add left right;`). Control flow uses `label`,
+`jmp`, and `cjmp`; function bodies end with `ret` when a value is returned.
+
+`ref value` produces a pointer to the selected value; applying it to a pointer
+produces a pointer-to-pointer. Pointer/integer conversions are never implicit.
+Use `#ptrcast` for an explicit pointer reinterpretation, `#ptrtoint` to obtain
+an integer address, or `#inttoptr` to reconstruct a pointer. These casts require
+an explicitly typed result. Pointer/integer conversions require the integer
+width to equal the target's pointer representation width and are not portable
+across targets with non-integral pointers. `#ptrcast` preserves the address but
+does not make accesses through the new type safe. A backend must retain declared
+PSI types rather than infer pointee types from its machine IR representation.
+Implicit pointer conversion is limited to `null` or an exactly matching base
+type and pointer depth. Use `#ptrcast` for other pointer reinterpretations;
+accessors and typed `load`/`store` must agree with the pointer's pointee type.
+
+### Primary instruction contract
+
+Instructions without `#` are the portable core. Their meanings come from PSI
+types, not the selected processor; a backend may use native instructions or
+software lowering but must preserve these results:
+
+- Integer `add`, `sub`, and `mul` wrap modulo the operand width. Integer
+  `div`/`mod` trap on a zero divisor and on signed minimum divided by `-1`.
+- Integer right shift is arithmetic for signed types and logical for unsigned
+  types. Either shift traps when the shift count is negative or at least the
+  operand width; counts are not silently masked by hardware.
+- For two numeric operands, the right operand converts to the left operand's
+  type before the operation. Integer widening follows the left operand's
+  signedness; integer/floating mixing is rejected. The left operand determines
+  operation width and signedness.
+- Integer comparisons are signed or unsigned according to the operand type.
+  Floating comparisons are ordered: comparisons involving NaN, including
+  `neq`, return false. `land`, `lor`, and `lnot` return normalized `bool`
+  values; `land`/`lor` are value operations, not short-circuit control flow.
+
+Division traps and out-of-range shifts are explicit PSI behavior, not accidental
+LLVM or CPU behavior. `#` operations naming a device service, ABI, register, or
+native instruction remain target-specific; use them only on documented targets.
+Their absence on another target does not alter the portable core.
 
 ```text
 entry main {

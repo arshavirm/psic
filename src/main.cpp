@@ -1,4 +1,3 @@
-#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -27,9 +26,8 @@ struct Options {
     std::string targetTriple;
     std::string arch;
     std::string os;
-    OptLevel opt;
+    OptLevel opt = OptLevel::O2;
 
-    bool compileOnly = false;
     bool emitIR = false;
     bool showHelp = false;
     bool showVersion = false;
@@ -94,7 +92,7 @@ enum class OptionAction {
     ShowHelp,
     ShowVersion,
     SetVerbose,
-    CompileOnly,
+    EmitObject,
     EmitLLVM,
     SetOutput,
     SetTargetTriple,
@@ -107,6 +105,7 @@ struct OptionSpec {
     const char* name;
     OptionAction action;
     bool takesValue;
+    OptLevel optimization = OptLevel::O2;
 };
 
 // All spellings of every command-line option. Value-taking options also
@@ -115,15 +114,18 @@ constexpr OptionSpec optionSpecs[] = {
     {"-h", OptionAction::ShowHelp, false},       {"--help", OptionAction::ShowHelp, false},
     {"--version", OptionAction::ShowVersion, false},
     {"-v", OptionAction::SetVerbose, false},     {"--verbose", OptionAction::SetVerbose, false},
-    {"-c", OptionAction::CompileOnly, false},    {"--compile", OptionAction::CompileOnly, false},
+    {"-c", OptionAction::EmitObject, false},     {"--compile", OptionAction::EmitObject, false},
     {"--emit-llvm", OptionAction::EmitLLVM, false},
     {"-o", OptionAction::SetOutput, true},       {"--output", OptionAction::SetOutput, true},
     {"-target", OptionAction::SetTargetTriple, true}, {"--target", OptionAction::SetTargetTriple, true},
     {"-march", OptionAction::SetArch, true},     {"--arch", OptionAction::SetArch, true},
     {"-mos", OptionAction::SetOs, true},         {"--os", OptionAction::SetOs, true},
-    {"-O0", OptionAction::SetOptLevel, false},   {"-O1", OptionAction::SetOptLevel, false},
-    {"-O2", OptionAction::SetOptLevel, false},   {"-O3", OptionAction::SetOptLevel, false},
-    {"-Os", OptionAction::SetOptLevel, false},   {"-Oz", OptionAction::SetOptLevel, false},
+    {"-O0", OptionAction::SetOptLevel, false, OptLevel::O0},
+    {"-O1", OptionAction::SetOptLevel, false, OptLevel::O1},
+    {"-O2", OptionAction::SetOptLevel, false, OptLevel::O2},
+    {"-O3", OptionAction::SetOptLevel, false, OptLevel::O3},
+    {"-Os", OptionAction::SetOptLevel, false, OptLevel::Os},
+    {"-Oz", OptionAction::SetOptLevel, false, OptLevel::Oz},
 };
 
 const OptionSpec* findOption(const std::string& arg)
@@ -151,43 +153,20 @@ bool requireValue(int argc, char** argv, int& i, const std::string& option,
     return true;
 }
 
-bool applyOption(const OptionSpec& spec, int argc, char** argv, int& i,
-    const std::string& arg, const std::string& inlineValue, Options& options)
+void applyOption(const OptionSpec& spec, const std::string& value, Options& options)
 {
-    std::string value;
-    if (spec.takesValue) {
-        // `--name=value` uses the inline value; otherwise consume the next argv.
-        if (inlineValue.empty() && arg.find('=') == std::string::npos
-            && !requireValue(argc, argv, i, arg, value)) {
-            return false;
-        }
-        if (!inlineValue.empty()) {
-            value = inlineValue;
-        }
-    }
-
     switch (spec.action) {
     case OptionAction::ShowHelp: options.showHelp = true; break;
     case OptionAction::ShowVersion: options.showVersion = true; break;
     case OptionAction::SetVerbose: options.verbose = true; break;
-    case OptionAction::CompileOnly: options.compileOnly = true; break;
+    case OptionAction::EmitObject: options.emitIR = false; break;
     case OptionAction::EmitLLVM: options.emitIR = true; break;
     case OptionAction::SetOutput: options.output = value; break;
     case OptionAction::SetTargetTriple: options.targetTriple = value; break;
     case OptionAction::SetArch: options.arch = value; break;
     case OptionAction::SetOs: options.os = value; break;
-    case OptionAction::SetOptLevel:
-        options.opt = [](const char* name) {
-            if (name == std::string("-O1")) return OptLevel::O1;
-            if (name == std::string("-O3")) return OptLevel::O3;
-            if (name == std::string("-Os")) return OptLevel::Os;
-            if (name == std::string("-Oz")) return OptLevel::Oz;
-            if (name == std::string("-O0")) return OptLevel::O0;
-            return OptLevel::O2;
-        }(spec.name);
-        break;
+    case OptionAction::SetOptLevel: options.opt = spec.optimization; break;
     }
-    return true;
 }
 
 } // namespace
@@ -207,8 +186,9 @@ static bool parseArguments(int argc, char** argv, Options& options)
         if (!endOfOptions) {
             const OptionSpec* spec = findOption(arg);
             if (spec) {
-                if (!applyOption(*spec, argc, argv, i, arg, "", options))
-                    return false;
+                std::string value;
+                if (spec->takesValue && !requireValue(argc, argv, i, arg, value)) return false;
+                applyOption(*spec, value, options);
                 continue;
             }
 
@@ -223,19 +203,9 @@ static bool parseArguments(int argc, char** argv, Options& options)
                         psi::logError("'" + name + "=' requires an argument");
                         return false;
                     }
-                    if (!applyOption(*inlineSpec, argc, argv, i, name, inlineValue, options))
-                        return false;
+                    applyOption(*inlineSpec, inlineValue, options);
                     continue;
                 }
-            }
-
-            if (arg == "-") {
-                if (!options.input.empty()) {
-                    psi::logError("multiple input files are not supported");
-                    return false;
-                }
-                options.input = "-";
-                continue;
             }
 
             if (isOption(arg)) {
@@ -309,10 +279,31 @@ static bool writeIR(const std::string& ir, const std::string& output)
     return true;
 }
 
+static bool writeObject(const std::vector<std::uint8_t>& object, const std::string& output)
+{
+    if (output == "-") {
+        psi::logError("object output to stdout is not supported; specify an output file");
+        return false;
+    }
+
+    std::ofstream file(output, std::ios::binary);
+    if (!file) {
+        psi::logError("cannot open output file '" + output + "'");
+        return false;
+    }
+
+    file.write(reinterpret_cast<const char*>(object.data()), object.size());
+    file.close();
+    if (!file) {
+        psi::logError("error writing output file '" + output + "'");
+        return false;
+    }
+    return true;
+}
+
 int main(int argc, char** argv)
 {
     Options options;
-    options.opt = OptLevel::O2;
 
     if (!parseArguments(argc, argv, options)) {
         if (psi::hadErrors()) {
@@ -368,25 +359,10 @@ int main(int argc, char** argv)
             }
         }
         if (!result.success) return 1;
-        if (options.emitIR) {
-            if (!writeIR(result.ir, options.output)) return 1;
-        } else {
-            if (options.output == "-") {
-                psi::logError("object output to stdout is not supported; specify an output file");
-                return 1;
-            }
-            std::ofstream output(options.output, std::ios::binary);
-            if (!output) {
-                psi::logError("cannot open output file '" + options.output + "'");
-                return 1;
-            }
-            output.write(reinterpret_cast<const char*>(result.object.data()), result.object.size());
-            output.close();
-            if (!output) {
-                psi::logError("error writing output file '" + options.output + "'");
-                return 1;
-            }
-        }
+        const bool outputWritten = options.emitIR
+            ? writeIR(result.ir, options.output)
+            : writeObject(result.object, options.output);
+        if (!outputWritten) return 1;
         if (options.output != "-")
             std::cout << "psic: compiled " << options.input << " -> " << options.output << "\n";
         return 0;

@@ -35,8 +35,33 @@ int main()
         auto first = psic::compile("func i32 sum i32 a i32 b { i32 result = add a b; ret result; }", options);
         check(first.success && first.ir.find("define i32 @sum") != std::string::npos, diagnostics(first));
         check(first.object.empty(), "IR compilation produced an object");
+        auto guardedCoreOps = psic::compile(
+            "func i32 core i32 a i32 b { i32 quotient = div a b; i32 shifted = lsh a b; i32 sum = add quotient shifted; ret sum; }",
+            options);
+        check(guardedCoreOps.success, diagnostics(guardedCoreOps));
+        check(guardedCoreOps.ir.find("@llvm.trap") != std::string::npos
+                && guardedCoreOps.ir.find("icmp uge") != std::string::npos,
+            "core division and shift edge behavior was not guarded");
         auto second = psic::compile("func i32 sum { ret 7; }");
         check(second.success && second.ir.find("ret i32 7") != std::string::npos, "state leaked between compilations");
+        auto escapedString = psic::compile(R"(func i8* text { ret "a\"b"; })");
+        check(escapedString.success, "escaped quote ended the string early: " + diagnostics(escapedString));
+        auto pointerCast = psic::compile("func i32* cast i8* p { i32* q = #ptrcast p; ret q; }");
+        check(pointerCast.success, "explicit pointer cast failed: " + diagnostics(pointerCast));
+        auto pointerIntegerCast = psic::compile("func u64 address i8* p { u64 n = #ptrtoint p; ret n; }");
+        check(pointerIntegerCast.success, "explicit pointer-to-integer cast failed: " + diagnostics(pointerIntegerCast));
+        psic::CompileOptions wasmPointerOptions;
+        wasmPointerOptions.architecture = "wasm32";
+        auto wasmPointerIntegerCast = psic::compile("func u32 address i8* p { u32 n = #ptrtoint p; ret n; }", wasmPointerOptions);
+        check(wasmPointerIntegerCast.success, "32-bit pointer conversion failed: " + diagnostics(wasmPointerIntegerCast));
+        auto integerPointerCast = psic::compile("func i8* restore u64 n { i8* p = #inttoptr n; ret p; }");
+        check(integerPointerCast.success, "explicit integer-to-pointer cast failed: " + diagnostics(integerPointerCast));
+        auto nullPointer = psic::compile("func i32* empty { i32* p = null; ret p; }");
+        check(nullPointer.success, "null pointer initialization failed: " + diagnostics(nullPointer));
+        auto referenceTypes = psic::compile("func i32 reference { i32 x = 5; i32* p = ref x; i32** pp = ref p; i32 y = p[0]; ret y; }");
+        check(referenceTypes.success, "reference pointer depth handling failed: " + diagnostics(referenceTypes));
+        auto pointerCopy = psic::compile("func i32* copy i32* p { i32* q = p; ret q; }");
+        check(pointerCopy.success, "matching pointer assignment failed: " + diagnostics(pointerCopy));
         for (auto level : {psic::OptimizationLevel::O0, psic::OptimizationLevel::O1,
              psic::OptimizationLevel::O2, psic::OptimizationLevel::O3, psic::OptimizationLevel::Os, psic::OptimizationLevel::Oz}) {
             options.optimization = level;
@@ -64,6 +89,7 @@ int main()
         check(!psic::compile("", options).success, "invalid output enum accepted");
 
         reject("/* unfinished", "unterminated block comment");
+        reject(R"(entry main { i8* text = "unfinished\"; })", "unterminated string literal");
         reject("entry main { i32 x = 0x; }", "hexadecimal digits");
         reject("entry main { i32 x = ;", "expected");
         reject("func void f { ret; } func void f { ret; }", "duplicate declaration");
@@ -86,11 +112,32 @@ int main()
         reject("entry main { i32 x; x = load x; }", "explicit result type");
         reject("entry main { i32 x = not 1.0; }", "integer operand");
         reject("entry main { i32 x = and 1.0 2.0; }", "integer operands");
+        reject("entry main { i32 x = add 1 2.0; }", "cannot mix integer and floating-point operands");
         reject("entry main { i32 x = missing; }", "undeclared register");
         reject("entry main { ret; i32 x = 1; }", "after a terminator");
         reject("func i32 f { i32 x = 1; }", "without a return");
         reject("i32* p = 12;", "numeric global initializer");
         reject("i32 p = \"text\";", "string initializer");
+        reject("func i8* bad i32 n { i8* p = n; ret p; }", "type mismatch");
+        reject("func i32 bad i64* p { i32 n = load p; ret n; }", "pointee type");
+        reject("func i32 bad { i32 n = load \"text\"; ret n; }", "pointee type");
+        reject("func i32* bad i64* p { i32* q = p; ret q; }", "pointer type mismatch");
+        reject("func i32* bad i64* p { ret p; }", "pointer type mismatch");
+        reject("func i32* take i32* p { ret p; } func i32 bad i64* q { i32* p = call take q; ret p; }", "pointer type mismatch");
+        reject("func void bad i32* p i64 x { store p x; ret; }", "pointer type mismatch");
+        reject("func void bad i64* p { store p 1; ret; }", "pointer type mismatch");
+        reject("func i32* bad i32 n { i32* p = #ptrcast n; ret p; }", "requires a pointer operand");
+        reject("func f32 bad i8* p { f32 n = #ptrtoint p; ret n; }", "integer result type");
+        reject("func i32* bad i32 n { i32* p = #inttoptr n; ret p; }", "operand width");
+        reject("func u32 bad i8* p { u32 n = #ptrtoint p; ret n; }", "result width");
+        for (const std::string& architecture : {"x86_64", "wasm32"}) {
+            psic::CompileOptions pointerOptions;
+            pointerOptions.architecture = architecture;
+            auto mismatch = psic::compile(
+                "func i32* bad i64* p { i32* q = p; ret q; }", pointerOptions);
+            check(!mismatch.success && diagnostics(mismatch).find("pointer type mismatch") != std::string::npos,
+                "pointer mismatch semantics changed for " + architecture + ": " + diagnostics(mismatch));
+        }
 
         std::vector<std::future<bool>> calls;
         for (int i = 0; i < 12; ++i) calls.push_back(std::async(std::launch::async, [i] {
