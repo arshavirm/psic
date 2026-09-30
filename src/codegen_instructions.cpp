@@ -10,19 +10,97 @@
 #include <llvm/IR/Verifier.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <unordered_map>
 
 namespace psi_codegen {
+
+static llvm::Value* flushSubnormal(llvm::Value* value, llvm::IRBuilder<>* builder)
+{
+    llvm::Type* valueType = value->getType();
+    auto* vectorType = llvm::dyn_cast<llvm::FixedVectorType>(valueType);
+    llvm::Type* laneType = vectorType ? vectorType->getElementType() : valueType;
+    if (!laneType->isFloatingPointTy()) return value;
+
+    const unsigned laneBits = laneType->getPrimitiveSizeInBits();
+    if (laneBits != 32 && laneBits != 64) return value;
+    llvm::Type* integerLaneType = llvm::IntegerType::get(builder->getContext(), laneBits);
+    llvm::Type* integerType = vectorType
+        ? llvm::FixedVectorType::get(integerLaneType, vectorType->getNumElements())
+        : integerLaneType;
+    llvm::Value* bits = builder->CreateBitCast(value, integerType);
+
+    const llvm::APInt exponentMask(laneBits,
+        laneBits == 32 ? 0x7f800000ULL : 0x7ff0000000000000ULL);
+    const llvm::APInt fractionMask(laneBits,
+        laneBits == 32 ? 0x007fffffULL : 0x000fffffffffffffULL);
+    const llvm::APInt signMask(laneBits,
+        laneBits == 32 ? 0x80000000ULL : 0x8000000000000000ULL);
+    auto integerConstant = [&](const llvm::APInt& constantBits) -> llvm::Value* {
+        llvm::Constant* laneConstant = llvm::ConstantInt::get(integerLaneType, constantBits);
+        if (!vectorType) return laneConstant;
+        return builder->CreateVectorSplat(vectorType->getNumElements(), laneConstant);
+    };
+
+    llvm::Value* exponent = builder->CreateAnd(bits, integerConstant(exponentMask));
+    llvm::Value* fraction = builder->CreateAnd(bits, integerConstant(fractionMask));
+    llvm::Value* isSubnormal = builder->CreateAnd(
+        builder->CreateICmpEQ(exponent, llvm::Constant::getNullValue(integerType)),
+        builder->CreateICmpNE(fraction, llvm::Constant::getNullValue(integerType)));
+    llvm::Value* signedZero = builder->CreateAnd(bits, integerConstant(signMask));
+    llvm::Value* normalized = builder->CreateSelect(isSubnormal, signedZero, bits);
+    return builder->CreateBitCast(normalized, valueType);
+}
+
+static llvm::Value* canonicalizeNaN(llvm::Value* value, llvm::IRBuilder<>* builder)
+{
+    value = flushSubnormal(value, builder);
+    llvm::Type* valueType = value->getType();
+    const bool isVector = valueType->isVectorTy();
+    auto* vectorType = isVector ? llvm::dyn_cast<llvm::FixedVectorType>(valueType) : nullptr;
+    llvm::Type* laneType = vectorType ? vectorType->getElementType() : valueType;
+    if (!laneType->isFloatingPointTy()) return value;
+
+    const unsigned laneBits = laneType->getPrimitiveSizeInBits();
+    const bool isF32 = laneBits == 32;
+    if (!isF32 && laneBits != 64) return value;
+    llvm::Type* integerLaneType = llvm::IntegerType::get(builder->getContext(), laneBits);
+    llvm::Type* integerType = vectorType
+        ? llvm::FixedVectorType::get(integerLaneType, vectorType->getNumElements())
+        : integerLaneType;
+    llvm::Value* bits = builder->CreateBitCast(value, integerType);
+
+    const llvm::APInt exponentMask(laneBits,
+        isF32 ? 0x7f800000ULL : 0x7ff0000000000000ULL);
+    const llvm::APInt fractionMask(laneBits,
+        isF32 ? 0x007fffffULL : 0x000fffffffffffffULL);
+    const llvm::APInt canonicalNaNBits = exponentMask | llvm::APInt(laneBits,
+        isF32 ? 0x00400000ULL : 0x0008000000000000ULL);
+    auto integerConstant = [&](const llvm::APInt& constantBits) -> llvm::Value* {
+        llvm::Constant* laneConstant = llvm::ConstantInt::get(integerLaneType, constantBits);
+        if (!vectorType) return laneConstant;
+        return builder->CreateVectorSplat(vectorType->getNumElements(), laneConstant);
+    };
+
+    llvm::Value* exponent = builder->CreateAnd(bits, integerConstant(exponentMask));
+    llvm::Value* fraction = builder->CreateAnd(bits, integerConstant(fractionMask));
+    llvm::Value* isNaN = builder->CreateAnd(
+        builder->CreateICmpEQ(exponent, integerConstant(exponentMask)),
+        builder->CreateICmpNE(fraction, llvm::Constant::getNullValue(integerType)));
+    llvm::Value* canonical = builder->CreateBitCast(
+        integerConstant(canonicalNaNBits), valueType);
+    return builder->CreateSelect(isNaN, canonical, value);
+}
 
 llvm::Value* processValue(State& s, const ValueNode& value, llvm::IRBuilder<>* builder)
 {
     switch (value.kind) {
     case ValueKind::Number:
         if (value.numberIsFloat) {
-            return llvm::ConstantFP::get(s.llvmTypes["f32"], value.numberAsFloat);
+            return llvm::ConstantFP::get(s.llvmTypes["f64"], value.numberAsFloat);
         }
-        return builder->getInt32(value.numberAsInt);
+        return builder->getInt64(value.numberAsInt);
     case ValueKind::String:
         return builder->CreateGlobalStringPtr(value.stringValue);
     case ValueKind::Register: {
@@ -34,7 +112,13 @@ llvm::Value* processValue(State& s, const ValueNode& value, llvm::IRBuilder<>* b
         if (!llvmType) {
             return nullptr;
         }
-        return builder->CreateLoad(llvmType, access.address);
+        if (std::any_of(value.registerValue.accessors.begin(),
+                value.registerValue.accessors.end(),
+                [](const AccessorNode& accessor) { return accessor.kind == AccessorKind::Index; })) {
+            trapIfNullPointer(access.address, builder);
+            trapIfAccessRangeWraps(access.address, llvmType, builder);
+        }
+        return loadValueBytewiseAtomic(*builder, llvmType, access.address);
     }
     case ValueKind::SpecialRegister:
         return processSpecialRegisterRead(s, value.specialRegisterValue, builder);
@@ -72,10 +156,11 @@ llvm::Value* coerceValue(llvm::Value* value, llvm::Type* targetType, llvm::IRBui
     }
 
     if (fromType->isFloatingPointTy() && targetType->isFloatingPointTy()) {
+        value = flushSubnormal(value, builder);
         if (fromType->getPrimitiveSizeInBits() < targetType->getPrimitiveSizeInBits()) {
-            return builder->CreateFPExt(value, targetType);
+            return canonicalizeNaN(builder->CreateFPExt(value, targetType), builder);
         }
-        return builder->CreateFPTrunc(value, targetType);
+        return canonicalizeNaN(builder->CreateFPTrunc(value, targetType), builder);
     }
 
     if (fromType->isPointerTy() && targetType->isPointerTy()) {
@@ -90,14 +175,16 @@ namespace {
 
 llvm::Value* buildLocalArrayLiteral(State& s, const ValueNode& arrayValue, const TypeNode& declaredType, llvm::IRBuilder<>* builder)
 {
-    if (declaredType.pointerLevel < 1) {
+    if (declaredType.pointerLevel < 1 && !declaredType.isView) {
         psi::ErrorStream() << "array initializer for '" << declaredType.baseName
-                           << "' needs a pointer type, e.g. " << declaredType.baseName << "*\n";
+                           << "' needs a pointer or bounded view type, e.g. "
+                           << declaredType.baseName << "* or " << declaredType.baseName << "[]\n";
         return nullptr;
     }
 
     TypeNode elementTypeNode = declaredType;
-    elementTypeNode.pointerLevel -= 1;
+    if (declaredType.isView) elementTypeNode.isView = false;
+    else elementTypeNode.pointerLevel -= 1;
     llvm::Type* elemType = resolveType(s, elementTypeNode);
     if (!elemType) {
         return nullptr;
@@ -117,12 +204,25 @@ llvm::Value* buildLocalArrayLiteral(State& s, const ValueNode& arrayValue, const
     }
 
     auto* arrayType = llvm::ArrayType::get(elemType, elements.size());
-    auto* arrayAlloca = builder->CreateAlloca(arrayType, nullptr, "arrlit");
+    // Allocate at the literal's execution point. A declaration inside a loop
+    // creates fresh backing storage each time so copied views keep referring to
+    // the previous execution's elements until this function returns.
+    llvm::AllocaInst* arrayAlloca = builder->CreateAlloca(arrayType, nullptr,
+        declaredType.isView ? "view.data" : "arrlit");
     for (size_t i = 0; i < elements.size(); i++) {
         llvm::Value* elementPtr = builder->CreateConstGEP2_32(arrayType, arrayAlloca, 0, (unsigned)i);
-        builder->CreateStore(elements[i], elementPtr);
+        storeValueWithZeroedPadding(*builder, elements[i], elementPtr);
     }
 
+    if (declaredType.isView) {
+        llvm::Type* viewType = resolveType(s, declaredType);
+        llvm::Value* data = builder->CreateConstGEP2_32(arrayType, arrayAlloca, 0, 0);
+        llvm::Value* view = llvm::UndefValue::get(viewType);
+        view = builder->CreateInsertValue(view, data, {0});
+        view = builder->CreateInsertValue(view,
+            builder->getInt64(static_cast<std::uint64_t>(elements.size())), {1});
+        return view;
+    }
     return arrayAlloca;
 }
 
@@ -142,7 +242,8 @@ void predeclareLabels(State& s, const std::vector<CommandNode>& commands, llvm::
     }
 }
 
-llvm::Value* processCallInstruction(State& s, const CommandNode& command, llvm::IRBuilder<>* builder)
+llvm::Value* processCallInstruction(State& s, const CommandNode& command, llvm::IRBuilder<>* builder,
+    const TypeNode* declaredType = nullptr)
 {
     if (command.values.empty() || command.values[0]->kind != ValueKind::Register) {
         psi::ErrorStream() << "'call' needs a function name as its first operand\n";
@@ -152,8 +253,24 @@ llvm::Value* processCallInstruction(State& s, const CommandNode& command, llvm::
     const std::string& calleeName = command.values[0]->registerValue.name;
     auto fnIt = s.functionDeclarations.find(calleeName);
     if (fnIt == s.functionDeclarations.end()) {
-        psi::ErrorStream() << "call to undefined function '" << calleeName << "'\n";
-        return nullptr;
+        llvm::Value* calleeValue = processValue(s, *command.values[0], builder);
+        if (!calleeValue || !calleeValue->getType()->isPointerTy()) {
+            psi::ErrorStream() << "indirect call requires a function pointer operand\n";
+            return nullptr;
+        }
+        trapIfNullPointer(calleeValue, builder);
+        std::vector<llvm::Type*> parameterTypes;
+        std::vector<llvm::Value*> args;
+        for (std::size_t i = 1; i < command.values.size(); ++i) {
+            auto* arg = processValue(s, *command.values[i], builder);
+            if (!arg) return nullptr;
+            parameterTypes.push_back(arg->getType());
+            args.push_back(arg);
+        }
+        llvm::Type* returnType = declaredType ? resolveType(s, *declaredType) : builder->getVoidTy();
+        if (!returnType) return nullptr;
+        auto* signature = llvm::FunctionType::get(returnType, parameterTypes, false);
+        return builder->CreateCall(signature, calleeValue, args);
     }
 
     llvm::Function* callee = fnIt->second;
@@ -192,7 +309,8 @@ llvm::Value* processRefInstruction(State& s, const CommandNode& command, llvm::I
         psi::ErrorStream() << "'ref' needs a register operand\n";
         return nullptr;
     }
-    RegisterAddress access = resolveRegisterAddress(s, command.values[0]->registerValue, builder);
+    RegisterAddress access = resolveRegisterAddress(s, command.values[0]->registerValue,
+        builder, false);
     return access.address;
 }
 
@@ -201,6 +319,18 @@ llvm::Value* processSyscallInstruction(State& s, const CommandNode& command, llv
     if (s.os != OperatingSystem::Linux) {
         psi::ErrorStream() << "'#syscall' currently supports only the Linux syscall ABI\n";
 
+        return nullptr;
+    }
+
+    std::string targetTriple = s.targetTriple;
+    std::transform(targetTriple.begin(), targetTriple.end(), targetTriple.begin(),
+        [](unsigned char character) {
+            return character >= 'A' && character <= 'Z'
+                ? static_cast<char>(character - 'A' + 'a') : static_cast<char>(character);
+        });
+    if (s.architecture == Architecture::X86_64
+        && targetTriple.find("gnux32") != std::string::npos) {
+        psi::ErrorStream() << "'#syscall' is not available for the Linux x32 ABI\n";
         return nullptr;
     }
 
@@ -315,12 +445,15 @@ llvm::Value* processFloatArithmeticInstruction(State& s,
         return nullptr;
     }
 
+    a = flushSubnormal(a, builder);
+    b = flushSubnormal(b, builder);
+
     // LLVM selects the target's scalar FP instruction (or a soft-float helper).
     // This also avoids tying the language operation to a target's asm operand syntax.
-    if (op == "fadd") return builder->CreateFAdd(a, b);
-    if (op == "fsub") return builder->CreateFSub(a, b);
-    if (op == "fmul") return builder->CreateFMul(a, b);
-    return builder->CreateFDiv(a, b);
+    if (op == "fadd") return canonicalizeNaN(builder->CreateFAdd(a, b), builder);
+    if (op == "fsub") return canonicalizeNaN(builder->CreateFSub(a, b), builder);
+    if (op == "fmul") return canonicalizeNaN(builder->CreateFMul(a, b), builder);
+    return canonicalizeNaN(builder->CreateFDiv(a, b), builder);
 }
 
 llvm::Value* processUnaryIntegerIntrinsic(State& s,
@@ -346,6 +479,8 @@ llvm::Value* processUnaryIntegerIntrinsic(State& s,
         intrinsic = llvm::Intrinsic::ctpop;
     else if (name == "bswap")
         intrinsic = llvm::Intrinsic::bswap;
+    else if (name == "bitreverse")
+        intrinsic = llvm::Intrinsic::bitreverse;
     else
         return nullptr;
 
@@ -385,26 +520,61 @@ llvm::Value* processVectorArithmeticInstruction(State& s,
     }
 
     bool isFloat = a->getType()->isFPOrFPVectorTy();
+    if (isFloat) {
+        a = flushSubnormal(a, builder);
+        b = flushSubnormal(b, builder);
+    }
 
     if (name == "vadd")
-        return isFloat ? builder->CreateFAdd(a, b) : builder->CreateAdd(a, b);
+        return isFloat ? canonicalizeNaN(builder->CreateFAdd(a, b), builder)
+                       : builder->CreateAdd(a, b);
     if (name == "vsub")
-        return isFloat ? builder->CreateFSub(a, b) : builder->CreateSub(a, b);
+        return isFloat ? canonicalizeNaN(builder->CreateFSub(a, b), builder)
+                       : builder->CreateSub(a, b);
     if (name == "vmul")
-        return isFloat ? builder->CreateFMul(a, b) : builder->CreateMul(a, b);
+        return isFloat ? canonicalizeNaN(builder->CreateFMul(a, b), builder)
+                       : builder->CreateMul(a, b);
     if (name == "vdiv") {
         if (!isFloat) {
             psi::ErrorStream() << "'#vdiv' needs a floating-point SIMD vector (f32xN/f64xN) - "
                                   "use '#vdivi' or '#vdivu' for integer lanes\n";
             return nullptr;
         }
-        return builder->CreateFDiv(a, b);
+        return canonicalizeNaN(builder->CreateFDiv(a, b), builder);
     }
     if (name == "vdivi" || name == "vdivu") {
         if (isFloat) {
             psi::ErrorStream() << "'#" << name << "' needs an integer SIMD vector - use '#vdiv' for f32xN/f64xN\n";
             return nullptr;
         }
+        const auto* vectorType = llvm::cast<llvm::FixedVectorType>(a->getType());
+        const unsigned laneCount = vectorType->getNumElements();
+        llvm::Type* laneType = vectorType->getElementType();
+        llvm::Value* zero = llvm::Constant::getNullValue(a->getType());
+        llvm::Value* invalidLanes = builder->CreateICmpEQ(b, zero);
+        if (name == "vdivi") {
+            const unsigned laneWidth = laneType->getIntegerBitWidth();
+            const auto minValue = llvm::ConstantInt::get(laneType,
+                llvm::APInt::getSignedMinValue(laneWidth));
+            llvm::Value* minimum = builder->CreateVectorSplat(laneCount, minValue);
+            llvm::Value* minusOne = llvm::Constant::getAllOnesValue(a->getType());
+            llvm::Value* overflowLanes = builder->CreateAnd(
+                builder->CreateICmpEQ(a, minimum),
+                builder->CreateICmpEQ(b, minusOne));
+            invalidLanes = builder->CreateOr(invalidLanes, overflowLanes);
+        }
+
+        // LLVM vector division is poison if any lane divides by zero or, for
+        // signed division, overflows. Reduce the per-lane checks before
+        // emitting the division so PSI's specified outcome is a trap.
+        llvm::Value* invalid = llvm::ConstantInt::getFalse(*s.context);
+        for (unsigned lane = 0; lane < laneCount; ++lane) {
+            llvm::Value* laneInvalid = builder->CreateExtractElement(
+                invalidLanes, builder->getInt32(lane));
+            invalid = builder->CreateOr(invalid, laneInvalid);
+        }
+
+        trapIfCondition(invalid, "vector.div", builder);
         return name == "vdivi" ? builder->CreateSDiv(a, b) : builder->CreateUDiv(a, b);
     }
     if (name == "vand")
@@ -419,7 +589,82 @@ llvm::Value* processVectorArithmeticInstruction(State& s,
             : (name == "vmin" ? llvm::Intrinsic::smin : llvm::Intrinsic::smax);
         llvm::Function* fn = llvm::Intrinsic::getDeclaration(
             builder->GetInsertBlock()->getModule(), id, { a->getType() });
-        return builder->CreateCall(fn, { a, b });
+        llvm::Value* result = builder->CreateCall(fn, { a, b });
+        if (!isFloat) return result;
+
+        // LLVM minnum/maxnum may choose either zero sign for equal operands.
+        // PSI gives that edge a stable rule: min selects -0 if either input
+        // is negative; max selects -0 only when both inputs are negative.
+        const auto* floatingVector = llvm::cast<llvm::FixedVectorType>(a->getType());
+        const unsigned laneCount = floatingVector->getNumElements();
+        llvm::Type* laneType = floatingVector->getElementType();
+        const unsigned laneBits = laneType->getPrimitiveSizeInBits();
+        llvm::Type* integerLaneType = llvm::IntegerType::get(*s.context, laneBits);
+        llvm::Type* integerVectorType = llvm::FixedVectorType::get(integerLaneType, laneCount);
+        llvm::Value* integerA = builder->CreateBitCast(a, integerVectorType);
+        llvm::Value* integerB = builder->CreateBitCast(b, integerVectorType);
+        const llvm::APInt signBit = llvm::APInt(laneBits, 1).shl(laneBits - 1);
+        llvm::Value* signMask = builder->CreateVectorSplat(laneCount,
+            llvm::ConstantInt::get(integerLaneType, signBit));
+        llvm::Value* signBits = name == "vmin"
+            ? builder->CreateOr(integerA, integerB)
+            : builder->CreateAnd(integerA, integerB);
+        llvm::Value* zeroBits = builder->CreateAnd(signBits, signMask);
+        llvm::Value* stableZero = builder->CreateBitCast(zeroBits, a->getType());
+        llvm::Value* zero = llvm::Constant::getNullValue(a->getType());
+        llvm::Value* bothZero = builder->CreateAnd(
+            builder->CreateFCmpOEQ(a, zero), builder->CreateFCmpOEQ(b, zero));
+
+        // Do not expose target-dependent NaN payload selection. A lone quiet
+        // NaN yields the numeric operand; two NaNs or any signaling NaN yield
+        // the canonical positive quiet NaN for the lane format.
+        const bool isF32 = laneBits == 32;
+        const llvm::APInt exponentMask = llvm::APInt(laneBits,
+            isF32 ? 0x7f800000ULL : 0x7ff0000000000000ULL);
+        const llvm::APInt fractionMask = llvm::APInt(laneBits,
+            isF32 ? 0x007fffffULL : 0x000fffffffffffffULL);
+        const llvm::APInt quietBit = llvm::APInt(laneBits,
+            isF32 ? 0x00400000ULL : 0x0008000000000000ULL);
+        const llvm::APInt canonicalNaNBits = exponentMask | quietBit;
+        auto splatInteger = [&](const llvm::APInt& bits) {
+            return builder->CreateVectorSplat(laneCount,
+                llvm::ConstantInt::get(integerLaneType, bits));
+        };
+        llvm::Value* exponentVector = splatInteger(exponentMask);
+        llvm::Value* fractionVector = splatInteger(fractionMask);
+        llvm::Value* quietVector = splatInteger(quietBit);
+        llvm::Value* canonicalNaN = splatInteger(canonicalNaNBits);
+        auto isNaN = [&](llvm::Value* bits) {
+            llvm::Value* allExponentBits = builder->CreateICmpEQ(
+                builder->CreateAnd(bits, exponentVector), exponentVector);
+            llvm::Value* hasFractionBits = builder->CreateICmpNE(
+                builder->CreateAnd(bits, fractionVector),
+                llvm::Constant::getNullValue(integerVectorType));
+            return builder->CreateAnd(allExponentBits, hasFractionBits);
+        };
+        llvm::Value* nanA = isNaN(integerA);
+        llvm::Value* nanB = isNaN(integerB);
+        llvm::Value* signalingA = builder->CreateAnd(nanA,
+            builder->CreateICmpEQ(builder->CreateAnd(integerA, quietVector),
+                llvm::Constant::getNullValue(integerVectorType)));
+        llvm::Value* signalingB = builder->CreateAnd(nanB,
+            builder->CreateICmpEQ(builder->CreateAnd(integerB, quietVector),
+                llvm::Constant::getNullValue(integerVectorType)));
+        llvm::Value* anySignalingNaN = builder->CreateOr(signalingA, signalingB);
+        llvm::Value* onlyNanA = builder->CreateAnd(nanA, builder->CreateNot(nanB));
+        llvm::Value* onlyNanB = builder->CreateAnd(nanB, builder->CreateNot(nanA));
+        llvm::Value* bothNaN = builder->CreateAnd(nanA, nanB);
+        llvm::Value* anyNaN = builder->CreateOr(nanA, nanB);
+
+        llvm::Value* nanResultBits = integerA;
+        nanResultBits = builder->CreateSelect(onlyNanA, integerB, nanResultBits);
+        nanResultBits = builder->CreateSelect(onlyNanB, integerA, nanResultBits);
+        nanResultBits = builder->CreateSelect(bothNaN, canonicalNaN, nanResultBits);
+        nanResultBits = builder->CreateSelect(anySignalingNaN,
+            canonicalNaN, nanResultBits);
+        llvm::Value* stableNaNResult = builder->CreateBitCast(nanResultBits, a->getType());
+        result = builder->CreateSelect(anyNaN, stableNaNResult, result);
+        return builder->CreateSelect(bothZero, stableZero, result);
     }
 
     return nullptr;
@@ -448,9 +693,13 @@ llvm::Value* processVectorFmaInstruction(State& s, const CommandNode& command, l
         return nullptr;
     }
 
+    a = flushSubnormal(a, builder);
+    b = flushSubnormal(b, builder);
+    c = flushSubnormal(c, builder);
+
     llvm::Function* fn = llvm::Intrinsic::getDeclaration(
         builder->GetInsertBlock()->getModule(), llvm::Intrinsic::fma, { a->getType() });
-    return builder->CreateCall(fn, { a, b, c });
+    return canonicalizeNaN(builder->CreateCall(fn, { a, b, c }), builder);
 }
 
 llvm::Value* processVectorSplatInstruction(State& s,
@@ -492,6 +741,58 @@ llvm::Value* processVectorSplatInstruction(State& s,
     return builder->CreateVectorSplat(numLanes, scalar);
 }
 
+llvm::Value* processCanonicalAtomicFloatRmw(llvm::AtomicRMWInst::BinOp op,
+    llvm::Value* pointer, llvm::Value* value, llvm::Align alignment,
+    llvm::IRBuilder<>* builder)
+{
+    llvm::Type* floatType = value->getType();
+    auto* bitsType = builder->getIntNTy(floatType->getPrimitiveSizeInBits());
+    llvm::Function* function = builder->GetInsertBlock()->getParent();
+    llvm::BasicBlock* preheader = builder->GetInsertBlock();
+    auto* retryBlock = llvm::BasicBlock::Create(builder->getContext(),
+        "atomic.float.retry", function);
+    auto* doneBlock = llvm::BasicBlock::Create(builder->getContext(),
+        "atomic.float.done", function);
+
+    // The monotonic seed load is only a candidate expected value. The
+    // successful sequentially consistent compare-exchange is the operation's
+    // linearization point; failed retries do not publish a floating result.
+    auto* initial = builder->CreateLoad(bitsType, pointer, "atomic.float.initial");
+    initial->setAlignment(alignment);
+    initial->setAtomic(llvm::AtomicOrdering::Monotonic);
+    builder->CreateBr(retryBlock);
+
+    builder->SetInsertPoint(retryBlock);
+    auto* expectedBits = builder->CreatePHI(bitsType, 2, "atomic.float.expected");
+    expectedBits->addIncoming(initial, preheader);
+    llvm::Value* oldValue = builder->CreateBitCast(expectedBits, floatType,
+        "atomic.float.old");
+    llvm::Value* normalizedOldValue = flushSubnormal(oldValue, builder);
+    value = flushSubnormal(value, builder);
+    llvm::Value* nextValue = op == llvm::AtomicRMWInst::FAdd
+        ? builder->CreateFAdd(normalizedOldValue, value, "atomic.float.sum")
+        : builder->CreateFSub(normalizedOldValue, value, "atomic.float.difference");
+    nextValue = canonicalizeNaN(nextValue, builder);
+    llvm::Value* nextBits = builder->CreateBitCast(nextValue, bitsType,
+        "atomic.float.next");
+
+    auto* exchange = builder->CreateAtomicCmpXchg(pointer, expectedBits, nextBits,
+        alignment, llvm::AtomicOrdering::SequentiallyConsistent,
+        llvm::AtomicOrdering::Monotonic);
+    exchange->setWeak(false);
+    llvm::Value* observedBits = builder->CreateExtractValue(exchange, 0,
+        "atomic.float.observed");
+    llvm::Value* succeeded = builder->CreateExtractValue(exchange, 1,
+        "atomic.float.exchanged");
+    expectedBits->addIncoming(observedBits, retryBlock);
+    builder->CreateCondBr(succeeded, doneBlock, retryBlock);
+
+    builder->SetInsertPoint(doneBlock);
+    // A successful compare-exchange observed exactly expectedBits. Return that
+    // old representation unchanged, even when it contains a NaN payload.
+    return builder->CreateBitCast(expectedBits, floatType, "atomic.float.result");
+}
+
 llvm::Value* processAtomicRMWInstruction(State& s,
     const std::string& name,
     llvm::AtomicRMWInst::BinOp op,
@@ -513,6 +814,7 @@ llvm::Value* processAtomicRMWInstruction(State& s,
         psi::ErrorStream() << "'#" << name << "' needs a pointer as its first operand\n";
         return nullptr;
     }
+    trapIfNullPointer(ptr, builder);
 
     bool isFloatOp = op == llvm::AtomicRMWInst::FAdd || op == llvm::AtomicRMWInst::FSub
         || op == llvm::AtomicRMWInst::FMax || op == llvm::AtomicRMWInst::FMin;
@@ -526,7 +828,17 @@ llvm::Value* processAtomicRMWInstruction(State& s,
         return nullptr;
     }
 
-    llvm::Align align(valType->getPrimitiveSizeInBits() / 8);
+    const auto& layout = builder->GetInsertBlock()->getModule()->getDataLayout();
+    llvm::Align align = layout.getABITypeAlign(valType);
+    if (op == llvm::AtomicRMWInst::FAdd || op == llvm::AtomicRMWInst::FSub) {
+        const llvm::Align compareExchangeAlignment(
+            valType->getPrimitiveSizeInBits() / 8);
+        if (align < compareExchangeAlignment) align = compareExchangeAlignment;
+    }
+    trapIfAccessRangeWraps(ptr, valType, builder);
+    trapIfMisalignedPointer(ptr, align, builder);
+    if (op == llvm::AtomicRMWInst::FAdd || op == llvm::AtomicRMWInst::FSub)
+        return processCanonicalAtomicFloatRmw(op, ptr, val, align, builder);
     return builder->CreateAtomicRMW(op, ptr, val, align, llvm::AtomicOrdering::SequentiallyConsistent);
 }
 
@@ -557,10 +869,15 @@ llvm::Value* processAtomicLoadInstruction(State& s,
         psi::ErrorStream() << "'#atomicload' needs a pointer operand\n";
         return nullptr;
     }
+    trapIfNullPointer(ptr, builder);
 
+    const llvm::Align align = builder->GetInsertBlock()->getModule()->getDataLayout()
+        .getABITypeAlign(loadType);
+    trapIfAccessRangeWraps(ptr, loadType, builder);
+    trapIfMisalignedPointer(ptr, align, builder);
     llvm::LoadInst* load = builder->CreateLoad(loadType, ptr);
-    load->setAtomic(llvm::AtomicOrdering::SequentiallyConsistent,
-        llvm::SyncScope::SingleThread);
+    load->setAlignment(align);
+    load->setAtomic(llvm::AtomicOrdering::SequentiallyConsistent);
     return load;
 }
 
@@ -580,10 +897,15 @@ llvm::Value* processAtomicStoreInstruction(State& s, const CommandNode& command,
         psi::ErrorStream() << "'#atomicstore' needs a pointer as its first operand\n";
         return nullptr;
     }
+    trapIfNullPointer(ptr, builder);
 
+    const llvm::Align align = builder->GetInsertBlock()->getModule()->getDataLayout()
+        .getABITypeAlign(val->getType());
+    trapIfAccessRangeWraps(ptr, val->getType(), builder);
+    trapIfMisalignedPointer(ptr, align, builder);
     llvm::StoreInst* store = builder->CreateStore(val, ptr);
-    store->setAtomic(llvm::AtomicOrdering::SequentiallyConsistent,
-        llvm::SyncScope::SingleThread);
+    store->setAlignment(align);
+    store->setAtomic(llvm::AtomicOrdering::SequentiallyConsistent);
     return nullptr;
 }
 
@@ -604,13 +926,17 @@ llvm::Value* processAtomicCasInstruction(State& s, const CommandNode& command, l
         psi::ErrorStream() << "'#cas' needs a pointer as its first operand\n";
         return nullptr;
     }
+    trapIfNullPointer(ptr, builder);
 
     desired = coerceValue(desired, expected->getType(), builder, "'#cas' desired-value operand");
     if (!desired) {
         return nullptr;
     }
 
-    llvm::Align align(expected->getType()->getPrimitiveSizeInBits() / 8);
+    const auto& layout = builder->GetInsertBlock()->getModule()->getDataLayout();
+    const llvm::Align align = layout.getABITypeAlign(expected->getType());
+    trapIfAccessRangeWraps(ptr, expected->getType(), builder);
+    trapIfMisalignedPointer(ptr, align, builder);
     llvm::AtomicCmpXchgInst* cmpxchg = builder->CreateAtomicCmpXchg(
         ptr, expected, desired, align,
         llvm::AtomicOrdering::SequentiallyConsistent,
@@ -637,11 +963,28 @@ NativeInstructionResult processNativeInstruction(State& s, const std::string& na
     std::string assembly;
     bool memoryBarrier = false;
     if (name == "nop") {
-        if (isWasm(s)) {
+        if (isWasm(s) || s.architecture == Architecture::LLVMGeneric) {
             if (!command.values.empty()) psi::ErrorStream() << "'#nop' takes no operands\n";
             return NativeInstructionResult::Handled;
         }
         assembly = s.architecture == Architecture::SystemZ ? "bcr 0, 0" : "nop";
+    }
+    if (name == "hlt" || name == "cli" || name == "sti") {
+        if (!x86) {
+            psi::ErrorStream() << "'#" << name << "' requires x86\n";
+            return NativeInstructionResult::Handled;
+        }
+        assembly = name;
+        memoryBarrier = true;
+    }
+    if (name == "cpu_relax") {
+        if (!command.values.empty()) {
+            psi::ErrorStream() << "'#cpu_relax' takes no operands\n";
+            return NativeInstructionResult::Handled;
+        }
+        if (x86) assembly = "pause";
+        else if (isARM(s.architecture)) assembly = "yield";
+        else return NativeInstructionResult::Handled; // Advisory hint; no-op on other targets.
     }
     if (x86 && (name == "lfence" || name == "sfence" || name == "mfence")) {
         assembly = name;
@@ -695,6 +1038,177 @@ NativeInstructionResult processNativeInstruction(State& s, const std::string& na
     return NativeInstructionResult::Handled;
 }
 
+static llvm::Value* processMemoryIntrinsicInstruction(State& s, const std::string& name,
+    const CommandNode& command, llvm::IRBuilder<>* builder)
+{
+    if (command.values.size() != 3) {
+        psi::ErrorStream() << "'#" << name << "' requires 3 operands\n";
+        return nullptr;
+    }
+
+    llvm::Value* destination = processValue(s, *command.values[0], builder);
+    llvm::Value* second = processValue(s, *command.values[1], builder);
+    llvm::Value* length = processValue(s, *command.values[2], builder);
+    const bool copy = name == "memcpy";
+    if (!destination || !second || !length || !destination->getType()->isPointerTy()
+        || (copy && !second->getType()->isPointerTy())
+        || !length->getType()->isIntegerTy()) {
+        psi::ErrorStream() << "'#" << name << "' requires pointer, "
+            << (copy ? "pointer" : "integer byte") << ", integer size operands\n";
+        return nullptr;
+    }
+
+    auto* intptr = builder->getIntPtrTy(builder->GetInsertBlock()->getModule()->getDataLayout());
+    const unsigned pointerWidth = intptr->getIntegerBitWidth();
+    if (length->getType()->getIntegerBitWidth() > pointerWidth) {
+        llvm::Type* sourceType = length->getType();
+        llvm::Value* narrowed = builder->CreateTrunc(length, intptr, "memory.length.narrow");
+        llvm::Value* restored = builder->CreateZExt(narrowed, sourceType, "memory.length.restored");
+        llvm::Value* tooLarge = builder->CreateICmpNE(length, restored, "memory.length.too_large");
+        llvm::Function* function = builder->GetInsertBlock()->getParent();
+        auto* trapBlock = llvm::BasicBlock::Create(builder->getContext(), "memory.length.trap", function);
+        auto* convertBlock = llvm::BasicBlock::Create(builder->getContext(), "memory.length.ok", function);
+        builder->CreateCondBr(tooLarge, trapBlock, convertBlock);
+        builder->SetInsertPoint(trapBlock);
+        llvm::Function* trap = llvm::Intrinsic::getDeclaration(
+            builder->GetInsertBlock()->getModule(), llvm::Intrinsic::trap);
+        builder->CreateCall(trap);
+        builder->CreateUnreachable();
+        builder->SetInsertPoint(convertBlock);
+        length = narrowed;
+    } else {
+        length = builder->CreateZExt(length, intptr);
+    }
+
+    trapIfAddressRangeWraps(destination, length, builder);
+    if (copy) trapIfAddressRangeWraps(second, length, builder);
+
+    llvm::Function* function = builder->GetInsertBlock()->getParent();
+    auto* accessBlock = llvm::BasicBlock::Create(builder->getContext(), "memory.nonzero", function);
+    auto* doneBlock = llvm::BasicBlock::Create(builder->getContext(), "memory.done", function);
+    llvm::Value* zeroLength = builder->CreateICmpEQ(length, llvm::ConstantInt::get(intptr, 0));
+    builder->CreateCondBr(zeroLength, doneBlock, accessBlock);
+    builder->SetInsertPoint(accessBlock);
+    trapIfNullPointer(destination, builder);
+    if (copy) trapIfNullPointer(second, builder);
+
+    // Ordinary PSI memory operations are sequentially consistent byte accesses.
+    // This both defines races with other PSI accesses and permits unaligned
+    // transfers on targets that only support naturally aligned atomics.
+    llvm::Type* byteType = builder->getInt8Ty();
+    auto* destinationBytes = builder->CreateBitCast(destination,
+        llvm::PointerType::get(byteType,
+            llvm::cast<llvm::PointerType>(destination->getType())->getAddressSpace()));
+    llvm::Value* sourceBytes = nullptr;
+    llvm::Value* copyBackward = llvm::ConstantInt::getFalse(builder->getContext());
+    if (copy) {
+        sourceBytes = builder->CreateBitCast(second,
+            llvm::PointerType::get(byteType,
+                llvm::cast<llvm::PointerType>(second->getType())->getAddressSpace()));
+        const auto& layout = builder->GetInsertBlock()->getModule()->getDataLayout();
+        llvm::Type* addressType = builder->getIntNTy(layout.getPointerSizeInBits(0));
+        llvm::Value* dstAddress = builder->CreatePtrToInt(destination, addressType);
+        llvm::Value* srcAddress = builder->CreatePtrToInt(second, addressType);
+        llvm::Value* destinationFollowsSource = builder->CreateICmpUGT(dstAddress, srcAddress);
+        llvm::Value* distance = builder->CreateSub(dstAddress, srcAddress);
+        copyBackward = builder->CreateAnd(destinationFollowsSource,
+            builder->CreateICmpULT(distance, length));
+    } else {
+        second = builder->CreateZExtOrTrunc(second, byteType);
+    }
+
+    llvm::BasicBlock* loopBlock = llvm::BasicBlock::Create(
+        builder->getContext(), "memory.byte.loop", function);
+    llvm::BasicBlock* bodyBlock = llvm::BasicBlock::Create(
+        builder->getContext(), "memory.byte.body", function);
+    llvm::BasicBlock* copyDoneBlock = llvm::BasicBlock::Create(
+        builder->getContext(), "memory.byte.done", function);
+    llvm::BasicBlock* preheader = builder->GetInsertBlock();
+    builder->CreateBr(loopBlock);
+    builder->SetInsertPoint(loopBlock);
+    auto* index = builder->CreatePHI(intptr, 2, "memory.byte.index");
+    index->addIncoming(llvm::ConstantInt::get(intptr, 0), preheader);
+    builder->CreateCondBr(builder->CreateICmpULT(index, length), bodyBlock, copyDoneBlock);
+
+    builder->SetInsertPoint(bodyBlock);
+    llvm::Value* byteIndex = index;
+    if (copy) {
+        llvm::Value* reverseIndex = builder->CreateSub(
+            builder->CreateSub(length, llvm::ConstantInt::get(intptr, 1)), index);
+        byteIndex = builder->CreateSelect(copyBackward, reverseIndex, index);
+    }
+    llvm::Value* destinationByteAddress = builder->CreateGEP(byteType,
+        destinationBytes, byteIndex);
+    llvm::Value* byteValue = second;
+    if (copy) {
+        llvm::Value* sourceByteAddress = builder->CreateGEP(byteType,
+            sourceBytes, byteIndex);
+        auto* byteLoad = builder->CreateLoad(byteType, sourceByteAddress);
+        byteLoad->setAlignment(llvm::Align(1));
+        byteLoad->setAtomic(llvm::AtomicOrdering::SequentiallyConsistent);
+        byteValue = byteLoad;
+    }
+    auto* byteStore = builder->CreateStore(byteValue, destinationByteAddress);
+    byteStore->setAlignment(llvm::Align(1));
+    byteStore->setAtomic(llvm::AtomicOrdering::SequentiallyConsistent);
+    llvm::Value* nextIndex = builder->CreateAdd(index,
+        llvm::ConstantInt::get(intptr, 1));
+    index->addIncoming(nextIndex, bodyBlock);
+    builder->CreateBr(loopBlock);
+
+    builder->SetInsertPoint(copyDoneBlock);
+    builder->CreateBr(doneBlock);
+    builder->SetInsertPoint(doneBlock);
+    return nullptr;
+}
+
+static llvm::Value* processFloatToIntegerCast(State& s, const std::string& name,
+    llvm::Value* operand, llvm::Type* resultType, llvm::IRBuilder<>* builder)
+{
+    if (!operand->getType()->isFloatingPointTy() || !resultType->isIntegerTy()) {
+        psi::ErrorStream() << "'#" << name
+                           << "' requires a floating-point source and integer result\n";
+        return nullptr;
+    }
+
+    operand = flushSubnormal(operand, builder);
+
+    // LLVM makes out-of-range FP-to-int conversions poison. PSI traps first.
+    const bool signedResult = name == "fptosi";
+    const unsigned resultBits = resultType->getIntegerBitWidth();
+    const double magnitude = std::ldexp(1.0,
+        signedResult ? resultBits - 1 : resultBits);
+    const double lower = signedResult ? -magnitude : 0.0;
+    llvm::Value* lowerBound = llvm::ConstantFP::get(operand->getType(), lower);
+    llvm::Value* upperBound = llvm::ConstantFP::get(operand->getType(), magnitude);
+    llvm::Value* inRange = builder->CreateAnd(
+        builder->CreateFCmpOGE(operand, lowerBound),
+        builder->CreateFCmpOLT(operand, upperBound));
+
+    llvm::Function* function = builder->GetInsertBlock()->getParent();
+    auto* convertBlock = llvm::BasicBlock::Create(*s.context, "cast.in_range", function);
+    auto* trapBlock = llvm::BasicBlock::Create(*s.context, "cast.out_of_range", function);
+    auto* mergeBlock = llvm::BasicBlock::Create(*s.context, "cast.done", function);
+    builder->CreateCondBr(inRange, convertBlock, trapBlock);
+
+    builder->SetInsertPoint(trapBlock);
+    llvm::Function* trap = llvm::Intrinsic::getDeclaration(
+        builder->GetInsertBlock()->getModule(), llvm::Intrinsic::trap);
+    builder->CreateCall(trap);
+    builder->CreateUnreachable();
+
+    builder->SetInsertPoint(convertBlock);
+    llvm::Value* converted = signedResult
+        ? builder->CreateFPToSI(operand, resultType)
+        : builder->CreateFPToUI(operand, resultType);
+    builder->CreateBr(mergeBlock);
+
+    builder->SetInsertPoint(mergeBlock);
+    auto* result = builder->CreatePHI(resultType, 1, "cast.result");
+    result->addIncoming(converted, convertBlock);
+    return result;
+}
+
 llvm::Value* processSpecialInstruction(State& s,
     const CommandNode& command,
     llvm::IRBuilder<>* builder,
@@ -702,6 +1216,200 @@ llvm::Value* processSpecialInstruction(State& s,
 {
     std::string name = command.instruction.name;
     std::replace(name.begin(), name.end(), '.', '_');
+
+    const bool viewLength = name == "view_len" || name == "viewlen";
+    const bool viewLoad = name == "view_load" || name == "viewload";
+    const bool viewStore = name == "view_store" || name == "viewstore";
+    const bool viewSlice = name == "view_slice" || name == "viewslice";
+    auto convertViewInteger = [&](const ValueNode& source, llvm::Value* value,
+                                  const std::string& context) {
+        bool unsignedSource = source.kind == ValueKind::Bool
+            || source.kind == ValueKind::SpecialRegister
+            || isDeclaredUnsigned(s, source);
+        if (!unsignedSource && source.kind == ValueKind::Register) {
+            TypeNode sourceType;
+            unsignedSource = resolveRegisterTypeNode(s, source.registerValue, sourceType)
+                && sourceType.baseName == "bool";
+        }
+        return coerceValue(value, builder->getInt64Ty(), builder, context, unsignedSource);
+    };
+    if (viewLength || viewLoad || viewStore || viewSlice) {
+        const std::size_t expected = viewLength ? 1u : viewLoad ? 2u : 3u;
+        if (command.values.size() != expected) {
+            psi::ErrorStream() << "'#" << name << "' requires " << expected << " operand(s)\n";
+            return nullptr;
+        }
+        const ValueNode& viewNode = *command.values[0];
+        TypeNode viewNodeType;
+        if (viewNode.kind != ValueKind::Register
+            || !resolveRegisterTypeNode(s, viewNode.registerValue, viewNodeType)
+            || !viewNodeType.isView || !viewNode.registerValue.accessors.empty()) {
+            psi::ErrorStream() << "'#" << name << "' requires a plain bounded-view register\n";
+            return nullptr;
+        }
+        llvm::Value* view = processValue(s, viewNode, builder);
+        if (!view) return nullptr;
+        if (viewLength)
+            return builder->CreateExtractValue(view, {1}, "view.length");
+
+        if (viewSlice) {
+            if (!declaredType || !declaredType->isView
+                || viewNodeType.baseName != declaredType->baseName
+                || viewNodeType.pointerLevel != declaredType->pointerLevel
+                || !viewNodeType.isView) {
+                psi::logError("'#viewslice' result must have the source view's element type");
+                return nullptr;
+            }
+            llvm::Value* start = processValue(s, *command.values[1], builder);
+            llvm::Value* count = processValue(s, *command.values[2], builder);
+            if (!start || !count || !start->getType()->isIntegerTy()
+                || !count->getType()->isIntegerTy()) {
+                psi::logError("'#viewslice' start and count must be integers");
+                return nullptr;
+            }
+            start = convertViewInteger(*command.values[1], start, "'#viewslice' start");
+            count = convertViewInteger(*command.values[2], count, "'#viewslice' count");
+            if (!start || !count) return nullptr;
+            llvm::Value* length = builder->CreateExtractValue(view, {1}, "view.length");
+            llvm::Value* startOutOfBounds = builder->CreateICmpUGT(start, length);
+            llvm::Value* remaining = builder->CreateSub(length, start, "view.remaining");
+            llvm::Value* countOutOfBounds = builder->CreateICmpUGT(count, remaining);
+            llvm::Value* outOfBounds = builder->CreateOr(startOutOfBounds, countOutOfBounds,
+                "view.slice.out_of_bounds");
+            llvm::Function* function = builder->GetInsertBlock()->getParent();
+            auto* trapBlock = llvm::BasicBlock::Create(*s.context, "view.slice.trap", function);
+            auto* accessBlock = llvm::BasicBlock::Create(*s.context, "view.slice.ok", function);
+            builder->CreateCondBr(outOfBounds, trapBlock, accessBlock);
+            builder->SetInsertPoint(trapBlock);
+            llvm::Function* trap = llvm::Intrinsic::getDeclaration(
+                builder->GetInsertBlock()->getModule(), llvm::Intrinsic::trap);
+            builder->CreateCall(trap);
+            builder->CreateUnreachable();
+
+            builder->SetInsertPoint(accessBlock);
+            TypeNode elementTypeNode = viewNodeType;
+            elementTypeNode.isView = false;
+            llvm::Type* elementType = resolveType(s, elementTypeNode);
+            if (!elementType) return nullptr;
+            llvm::Value* data = builder->CreateExtractValue(view, {0}, "view.data");
+            llvm::Value* slicedData = builder->CreateGEP(elementType, data, start, "view.slice.data");
+            llvm::Type* resultType = resolveType(s, *declaredType);
+            if (!resultType) return nullptr;
+            llvm::Value* result = llvm::UndefValue::get(resultType);
+            result = builder->CreateInsertValue(result, slicedData, {0});
+            return builder->CreateInsertValue(result, count, {1}, "view.slice");
+        }
+
+        const std::size_t indexOperand = 1;
+        llvm::Value* index = processValue(s, *command.values[indexOperand], builder);
+        if (!index || !index->getType()->isIntegerTy()) {
+            psi::ErrorStream() << "'#" << name << "' index must be an integer\n";
+            return nullptr;
+        }
+        index = convertViewInteger(*command.values[indexOperand], index,
+            "'#" + name + "' index");
+        if (!index) return nullptr;
+        llvm::Value* length = builder->CreateExtractValue(view, {1}, "view.length");
+        llvm::Value* outOfBounds = builder->CreateICmpUGE(index, length, "view.out_of_bounds");
+        llvm::Function* function = builder->GetInsertBlock()->getParent();
+        auto* trapBlock = llvm::BasicBlock::Create(*s.context, "view.bounds.trap", function);
+        auto* accessBlock = llvm::BasicBlock::Create(*s.context, "view.bounds.ok", function);
+        builder->CreateCondBr(outOfBounds, trapBlock, accessBlock);
+
+        builder->SetInsertPoint(trapBlock);
+        llvm::Function* trap = llvm::Intrinsic::getDeclaration(
+            builder->GetInsertBlock()->getModule(), llvm::Intrinsic::trap);
+        builder->CreateCall(trap);
+        builder->CreateUnreachable();
+
+        builder->SetInsertPoint(accessBlock);
+        TypeNode elementTypeNode = viewNodeType;
+        elementTypeNode.isView = false;
+        llvm::Type* elementType = resolveType(s, elementTypeNode);
+        if (!elementType) return nullptr;
+        if (viewLoad && (!declaredType || resolveType(s, *declaredType) != elementType)) {
+            psi::ErrorStream() << "'#viewload' result type must match the view element type\n";
+            return nullptr;
+        }
+        llvm::Value* value = nullptr;
+        if (viewStore) {
+            value = processValue(s, *command.values[2], builder);
+            if (!value || value->getType() != elementType) {
+                psi::ErrorStream() << "'#viewstore' value type must match the view element type\n";
+                return nullptr;
+            }
+        }
+        llvm::Value* data = builder->CreateExtractValue(view, {0}, "view.data");
+        trapIfNullPointer(data, builder);
+        llvm::Value* address = builder->CreateGEP(elementType, data, index);
+        // A view's length check protects the logical index. Keep the memory
+        // access itself consistent with ordinary PSI accesses: null and
+        // address-wrap trap, and byte alignment is sufficient.
+        trapIfNullPointer(address, builder);
+        trapIfAccessRangeWraps(address, elementType, builder);
+        if (viewLoad) {
+            return loadValueBytewiseAtomic(*builder, elementType, address);
+        }
+        // This helper emits byte-aligned stores and clears structure padding.
+        storeValueWithZeroedPadding(*builder, value, address);
+        return nullptr;
+    }
+
+    if (name == "sitofp" || name == "uitofp" || name == "fptosi" || name == "fptoui") {
+        if (!declaredType || command.values.size() != 1) {
+            psi::ErrorStream() << "'#" << name
+                               << "' requires one operand and an explicitly typed result\n";
+            return nullptr;
+        }
+        llvm::Value* operand = processValue(s, *command.values[0], builder);
+        llvm::Type* resultType = resolveType(s, *declaredType);
+        if (!operand || !resultType) return nullptr;
+
+        if (name == "sitofp" || name == "uitofp") {
+            if (!operand->getType()->isIntegerTy() || !resultType->isFloatingPointTy()) {
+                psi::ErrorStream() << "'#" << name
+                                   << "' requires an integer source and floating-point result\n";
+                return nullptr;
+            }
+            return name == "sitofp"
+                ? builder->CreateSIToFP(operand, resultType)
+                : builder->CreateUIToFP(operand, resultType);
+        }
+
+        return processFloatToIntegerCast(s, name, operand, resultType, builder);
+    }
+
+    if (name == "trunc" || name == "sext" || name == "zext"
+        || name == "fpext" || name == "fptrunc") {
+        if (!declaredType || command.values.size() != 1) {
+            psi::ErrorStream() << "'#" << name
+                               << "' requires one operand and an explicitly typed result\n";
+            return nullptr;
+        }
+        llvm::Value* operand = processValue(s, *command.values[0], builder);
+        llvm::Type* resultType = resolveType(s, *declaredType);
+        if (!operand || !resultType) return nullptr;
+
+        llvm::Type* sourceType = operand->getType();
+        if (name == "trunc" || name == "sext" || name == "zext") {
+            if (!sourceType->isIntegerTy() || !resultType->isIntegerTy()) {
+                psi::ErrorStream() << "'#" << name << "' requires integer types\n";
+                return nullptr;
+            }
+            if (name == "trunc") return builder->CreateTrunc(operand, resultType);
+            return name == "sext"
+                ? builder->CreateSExt(operand, resultType)
+                : builder->CreateZExt(operand, resultType);
+        }
+        if (!sourceType->isFloatingPointTy() || !resultType->isFloatingPointTy()) {
+            psi::ErrorStream() << "'#" << name << "' requires floating-point types\n";
+            return nullptr;
+        }
+        operand = flushSubnormal(operand, builder);
+        return name == "fpext"
+            ? canonicalizeNaN(builder->CreateFPExt(operand, resultType), builder)
+            : canonicalizeNaN(builder->CreateFPTrunc(operand, resultType), builder);
+    }
 
     if (name == "ptrcast" || name == "ptrtoint" || name == "inttoptr") {
         if (!declaredType || command.values.size() != 1) {
@@ -779,7 +1487,8 @@ llvm::Value* processSpecialInstruction(State& s,
     if (name == "syscall")
         return processSyscallInstruction(s, command, builder);
 
-    if (name == "clz" || name == "ctz" || name == "popcnt" || name == "bswap") {
+    if (name == "clz" || name == "ctz" || name == "popcnt"
+        || name == "bswap" || name == "bitreverse") {
         if (command.values.size() != 1) {
             psi::ErrorStream() << "'#" << name
                                << "' needs exactly 1 operand\n";
@@ -797,6 +1506,40 @@ llvm::Value* processSpecialInstruction(State& s,
         }
 
         builder->CreateFence(llvm::AtomicOrdering::SequentiallyConsistent);
+        return nullptr;
+    }
+
+    if (name == "memcpy" || name == "memset")
+        return processMemoryIntrinsicInstruction(s, name, command, builder);
+
+    if (name == "inb" || name == "outb") {
+        if (!x86) {
+            psi::ErrorStream() << "'#" << name << "' requires x86\n";
+            return nullptr;
+        }
+        const std::size_t expected = name == "inb" ? 1 : 2;
+        if (command.values.size() != expected) {
+            psi::ErrorStream() << "'#" << name << "' requires " << expected << " operand(s)\n";
+            return nullptr;
+        }
+        auto* port = processValue(s, *command.values[0], builder);
+        if (!port || !port->getType()->isIntegerTy()) {
+            psi::ErrorStream() << "'#" << name << "' port must be an integer\n";
+            return nullptr;
+        }
+        port = builder->CreateZExtOrTrunc(port, builder->getInt16Ty());
+        if (name == "inb") {
+            auto* type = llvm::FunctionType::get(builder->getInt8Ty(), {builder->getInt16Ty()}, false);
+            return builder->CreateCall(llvm::InlineAsm::get(type, "inb $1, $0", "={al},{dx},~{memory}", true), {port});
+        }
+        auto* value = processValue(s, *command.values[1], builder);
+        if (!value || !value->getType()->isIntegerTy()) {
+            psi::ErrorStream() << "'#outb' value must be an integer\n";
+            return nullptr;
+        }
+        value = builder->CreateZExtOrTrunc(value, builder->getInt8Ty());
+        auto* type = llvm::FunctionType::get(builder->getVoidTy(), {builder->getInt8Ty(), builder->getInt16Ty()}, false);
+        builder->CreateCall(llvm::InlineAsm::get(type, "outb $0, $1", "{al},{dx},~{memory}", true), {value, port});
         return nullptr;
     }
 
@@ -903,7 +1646,7 @@ llvm::Value* processSpecialInstruction(State& s,
             return processAtomicStoreInstruction(s, command, builder);
     }
 
-    if (name == "cas") {
+    if (name == "cas" || name == "atomic_cas") {
         return processAtomicCasInstruction(s, command, builder);
     }
 
@@ -944,16 +1687,10 @@ void processUntargetedInstruction(State& s, const CommandNode& command, llvm::IR
                 return;
             }
             --pointerType.pointerLevel;
-            TypeNode valueType;
-            if (command.values[1]->kind == ValueKind::Register
-                && resolveRegisterTypeNode(s, command.values[1]->registerValue, valueType)
-                && (valueType.baseName != pointerType.baseName
-                    || valueType.pointerLevel != pointerType.pointerLevel)) {
-                psi::logError("'store' value type must match the pointer's pointee type");
-                return;
-            }
         }
-        builder->CreateStore(value, pointer);
+        trapIfNullPointer(pointer, builder);
+        trapIfAccessRangeWraps(pointer, value->getType(), builder);
+        storeValueWithZeroedPadding(*builder, value, pointer);
         return;
     }
 
@@ -1021,17 +1758,24 @@ void processLocalDeclaration(State& s, const CommandNode& command, llvm::IRBuild
     const std::string& name = command.targetRegister.name;
     auto existing = s.locals.find(name);
     if (existing != s.locals.end()) {
-        if (hasInitializer) builder->CreateStore(value, existing->second);
+        if (hasInitializer) storeValueWithZeroedPadding(*builder, value, existing->second);
         return;
     }
 
-    auto* slot = builder->CreateAlloca(type, nullptr, name);
-    if (command.declaredType.alignment > 0)
-        slot->setAlignment(llvm::Align(command.declaredType.alignment));
+    auto storage = s.localStorage.find(name);
+    llvm::Value* slot = storage != s.localStorage.end() ? storage->second : nullptr;
+    if (!slot) slot = builder->CreateAlloca(type, nullptr, name);
+    const llvm::Align naturalAlignment = builder->GetInsertBlock()->getModule()
+        ->getDataLayout().getABITypeAlign(type);
+    const unsigned requestedAlignment = command.declaredType.alignment > 0
+        ? static_cast<unsigned>(command.declaredType.alignment) : 0;
+    if (auto* alloca = llvm::dyn_cast<llvm::AllocaInst>(slot))
+        alloca->setAlignment(llvm::Align(std::max<std::uint64_t>(
+            naturalAlignment.value(), requestedAlignment)));
     s.locals[name] = slot;
     s.localTypes[name] = command.declaredType;
     s.declaredLocalNames.push_back(name);
-    if (hasInitializer) builder->CreateStore(value, slot);
+    if (hasInitializer) storeValueWithZeroedPadding(*builder, value, slot);
 }
 
 void processRegisterAssignment(State& s, const CommandNode& command, llvm::IRBuilder<>* builder)
@@ -1043,9 +1787,17 @@ void processRegisterAssignment(State& s, const CommandNode& command, llvm::IRBui
     if (!access.address) return;
     llvm::Type* targetType = resolveType(s, access.typeNode);
     if (!targetType) return;
+        if (std::any_of(command.targetRegister.accessors.begin(),
+                command.targetRegister.accessors.end(),
+                [](const AccessorNode& accessor) { return accessor.kind == AccessorKind::Index; })) {
+            trapIfNullPointer(access.address, builder);
+            trapIfAccessRangeWraps(access.address, targetType, builder);
+        }
     value = coerceValue(value, targetType, builder, "assignment to '" + command.targetRegister.name + "'",
         isUnsignedTypeName(access.typeNode.baseName));
-    if (value) builder->CreateStore(value, access.address);
+    if (value) {
+        storeValueWithZeroedPadding(*builder, value, access.address);
+    }
 }
 
 llvm::Value* processBinaryInstruction(State& s, const std::string& op,
@@ -1053,7 +1805,84 @@ llvm::Value* processBinaryInstruction(State& s, const std::string& op,
 {
     llvm::Value* lhs = !command.values.empty() ? processValue(s, *command.values[0], builder) : nullptr;
     llvm::Value* rhs = command.values.size() > 1 ? processValue(s, *command.values[1], builder) : nullptr;
-    if (!lhs || !rhs) return nullptr;
+        if (!lhs || !rhs) return nullptr;
+
+    auto operandType = [&](const ValueNode& value, TypeNode& type) {
+        if (value.kind == ValueKind::Register) {
+            RegisterAddress address = resolveRegisterAddress(s, value.registerValue, builder);
+            if (!address.address) return false;
+            type = address.typeNode;
+            return true;
+        }
+        if (value.kind == ValueKind::String) { type = {"i8", 1}; return true; }
+        return false;
+    };
+    TypeNode leftType, rightType;
+    const bool haveLeftType = operandType(*command.values[0], leftType);
+    const bool haveRightType = operandType(*command.values[1], rightType);
+    const bool leftPointer = haveLeftType && leftType.pointerLevel > 0;
+    const bool rightPointer = haveRightType && rightType.pointerLevel > 0;
+    if ((op == "add" && (leftPointer || rightPointer)) || (op == "sub" && leftPointer)) {
+        const bool pointerOnLeft = leftPointer;
+        const TypeNode pointerType = pointerOnLeft ? leftType : rightType;
+        TypeNode elementTypeNode = pointerType;
+        --elementTypeNode.pointerLevel;
+        llvm::Type* elementType = resolveType(s, elementTypeNode);
+        if (!elementType) return nullptr;
+        const auto elementSize = builder->GetInsertBlock()->getModule()->getDataLayout().getTypeAllocSize(elementType);
+        if (elementSize.isScalable() || elementSize.getFixedValue() == 0) {
+            psi::logError("pointer arithmetic requires a nonzero, fixed object size");
+            return nullptr;
+        }
+        llvm::Value* pointer = pointerOnLeft ? lhs : rhs;
+        llvm::Value* offset = pointerOnLeft ? rhs : lhs;
+        if (op == "sub") {
+            llvm::Type* intptr = builder->getIntPtrTy(builder->GetInsertBlock()->getModule()->getDataLayout());
+            llvm::Value* leftAddress = builder->CreatePtrToInt(lhs, intptr);
+            llvm::Value* rightAddress = builder->CreatePtrToInt(rhs, intptr);
+            llvm::Value* addressDelta = builder->CreateSub(leftAddress, rightAddress,
+                "ptr.diff.bytes");
+
+            // Interpret the wrapped address delta as signed, while keeping the
+            // object size positive even when it exceeds the signed pointer
+            // range. The extra bit also prevents sdiv's min/-1 poison case.
+            const unsigned pointerBits = intptr->getIntegerBitWidth();
+            llvm::Type* divisionType = builder->getIntNTy(pointerBits + 1);
+            llvm::Value* signedDelta = builder->CreateSExt(addressDelta, divisionType,
+                "ptr.diff.signed_bytes");
+            llvm::Value* positiveElementSize = llvm::ConstantInt::get(
+                divisionType, elementSize.getFixedValue());
+            llvm::Value* elementDelta = builder->CreateSDiv(
+                signedDelta, positiveElementSize, "ptr.diff.elements");
+            return builder->CreateTrunc(elementDelta, intptr, "ptr.diff.result");
+        }
+        if (!offset->getType()->isIntegerTy()) {
+            psi::logError("pointer arithmetic requires an integer offset");
+            return nullptr;
+        }
+        const auto& layout = builder->GetInsertBlock()->getModule()->getDataLayout();
+        const unsigned addressSpace = pointer->getType()->getPointerAddressSpace();
+        const unsigned indexBits = layout.getIndexSizeInBits(addressSpace);
+        llvm::Type* indexType = llvm::IntegerType::get(builder->getContext(), indexBits);
+        const ValueNode& offsetNode = *command.values[pointerOnLeft ? 1 : 0];
+        const bool unsignedOffset = isDeclaredUnsigned(s, offsetNode);
+        const unsigned offsetBits = offset->getType()->getIntegerBitWidth();
+        if (offsetBits < indexBits)
+            offset = unsignedOffset ? builder->CreateZExt(offset, indexType) : builder->CreateSExt(offset, indexType);
+        else if (offsetBits > indexBits)
+            offset = builder->CreateTrunc(offset, indexType);
+        return builder->CreateGEP(elementType, pointer, offset, "ptr.offset");
+    }
+    if ((leftPointer || rightPointer || command.values[0]->kind == ValueKind::Null
+            || command.values[1]->kind == ValueKind::Null)
+        && (op == "eq" || op == "neq" || op == "gt" || op == "lt" || op == "gte" || op == "lte")) {
+        if (op == "eq") return builder->CreateICmpEQ(lhs, rhs);
+        if (op == "neq") return builder->CreateICmpNE(lhs, rhs);
+        if (op == "gt") return builder->CreateICmpUGT(lhs, rhs);
+        if (op == "lt") return builder->CreateICmpULT(lhs, rhs);
+        if (op == "gte") return builder->CreateICmpUGE(lhs, rhs);
+        return builder->CreateICmpULE(lhs, rhs);
+    }
 
     const bool isUnsigned = isDeclaredUnsigned(s, *command.values[0]);
     rhs = coerceValue(rhs, lhs->getType(), builder, "'" + op + "'", isUnsigned);
@@ -1071,24 +1900,19 @@ llvm::Value* processBinaryInstruction(State& s, const std::string& op,
         return nullptr;
     }
 
-    auto trapIf = [&](llvm::Value* condition) {
-        llvm::Function* function = builder->GetInsertBlock()->getParent();
-        llvm::BasicBlock* trapBlock = llvm::BasicBlock::Create(*s.context, "psi.trap", function);
-        llvm::BasicBlock* continueBlock = llvm::BasicBlock::Create(*s.context, "psi.cont", function);
-        builder->CreateCondBr(condition, trapBlock, continueBlock);
-        builder->SetInsertPoint(trapBlock);
-        llvm::Function* trap = llvm::Intrinsic::getDeclaration(
-            builder->GetInsertBlock()->getModule(), llvm::Intrinsic::trap);
-        builder->CreateCall(trap);
-        builder->CreateUnreachable();
-        builder->SetInsertPoint(continueBlock);
-    };
+    if (isFloat) {
+        lhs = flushSubnormal(lhs, builder);
+        rhs = flushSubnormal(rhs, builder);
+    }
 
-    if (op == "add") return isFloat ? builder->CreateFAdd(lhs, rhs) : builder->CreateAdd(lhs, rhs);
-    if (op == "sub") return isFloat ? builder->CreateFSub(lhs, rhs) : builder->CreateSub(lhs, rhs);
-    if (op == "mul") return isFloat ? builder->CreateFMul(lhs, rhs) : builder->CreateMul(lhs, rhs);
+    if (op == "add") return isFloat
+        ? canonicalizeNaN(builder->CreateFAdd(lhs, rhs), builder) : builder->CreateAdd(lhs, rhs);
+    if (op == "sub") return isFloat
+        ? canonicalizeNaN(builder->CreateFSub(lhs, rhs), builder) : builder->CreateSub(lhs, rhs);
+    if (op == "mul") return isFloat
+        ? canonicalizeNaN(builder->CreateFMul(lhs, rhs), builder) : builder->CreateMul(lhs, rhs);
     if (op == "div") {
-        if (isFloat) return builder->CreateFDiv(lhs, rhs);
+        if (isFloat) return canonicalizeNaN(builder->CreateFDiv(lhs, rhs), builder);
         llvm::Value* invalid = builder->CreateICmpEQ(rhs,
             llvm::ConstantInt::get(rhs->getType(), 0));
         if (!isUnsigned) {
@@ -1101,11 +1925,11 @@ llvm::Value* processBinaryInstruction(State& s, const std::string& op,
             invalid = builder->CreateOr(invalid,
                 builder->CreateAnd(isMinimum, isNegativeOne));
         }
-        trapIf(invalid);
+        trapIfCondition(invalid, "integer.division", builder);
         return isUnsigned ? builder->CreateUDiv(lhs, rhs) : builder->CreateSDiv(lhs, rhs);
     }
     if (op == "mod") {
-        if (isFloat) return builder->CreateFRem(lhs, rhs);
+        if (isFloat) return canonicalizeNaN(builder->CreateFRem(lhs, rhs), builder);
         llvm::Value* invalid = builder->CreateICmpEQ(rhs,
             llvm::ConstantInt::get(rhs->getType(), 0));
         if (!isUnsigned) {
@@ -1118,7 +1942,7 @@ llvm::Value* processBinaryInstruction(State& s, const std::string& op,
             invalid = builder->CreateOr(invalid,
                 builder->CreateAnd(isMinimum, isNegativeOne));
         }
-        trapIf(invalid);
+        trapIfCondition(invalid, "integer.remainder", builder);
         return isUnsigned ? builder->CreateURem(lhs, rhs) : builder->CreateSRem(lhs, rhs);
     }
     if (op == "eq") return isFloat ? builder->CreateFCmpOEQ(lhs, rhs) : builder->CreateICmpEQ(lhs, rhs);
@@ -1145,7 +1969,7 @@ llvm::Value* processBinaryInstruction(State& s, const std::string& op,
     if (op == "lsh" || op == "rsh") {
         llvm::Value* tooLarge = builder->CreateICmpUGE(rhs,
             llvm::ConstantInt::get(rhs->getType(), lhs->getType()->getIntegerBitWidth()));
-        trapIf(tooLarge);
+        trapIfCondition(tooLarge, "integer.shift", builder);
         if (op == "lsh") return builder->CreateShl(lhs, rhs);
         return isUnsigned ? builder->CreateLShr(lhs, rhs) : builder->CreateAShr(lhs, rhs);
     }
@@ -1177,7 +2001,7 @@ llvm::Value* computeCommandValue(State& s, const CommandNode& command, llvm::IRB
         const std::string& op = command.instruction.name;
 
         if (op == "call") {
-            return processCallInstruction(s, command, builder);
+            return processCallInstruction(s, command, builder, declaredType);
         }
         if (op == "ref") {
             return processRefInstruction(s, command, builder);
@@ -1205,7 +2029,9 @@ llvm::Value* computeCommandValue(State& s, const CommandNode& command, llvm::IRB
                     return nullptr;
                 }
             }
-            return builder->CreateLoad(type, p);
+            trapIfNullPointer(p, builder);
+            trapIfAccessRangeWraps(p, type, builder);
+            return loadValueBytewiseAtomic(*builder, type, p);
         }
         if (op == "not") {
             auto* v = processValue(s, *command.values[0], builder);
@@ -1238,6 +2064,8 @@ llvm::Value* computeCommandValue(State& s, const CommandNode& command, llvm::IRB
 
 void processCommand(State& s, const CommandNode& command, llvm::IRBuilder<>* builder)
 {
+    psi::DiagnosticLocationScope diagnosticLocation(command.location.line,
+        command.location.column);
     if (command.isEmpty) {
         return;
     }
@@ -1270,6 +2098,7 @@ void generateFunctionBody(State& s, const BlockNode& body, llvm::Function* funct
 {
     s.labels.clear();
     s.locals.clear();
+    s.localStorage.clear();
     s.localTypes.clear();
     s.declaredLocalNames.clear();
 
@@ -1281,13 +2110,34 @@ void generateFunctionBody(State& s, const BlockNode& body, llvm::Function* funct
     llvm::IRBuilder<> builder(*s.context);
     builder.SetInsertPoint(entry_block);
 
+    // Reserve all local storage in the entry block. A jump may enter after a
+    // declaration, so stack storage must not depend on reaching that command.
+    llvm::IRBuilder<> storageBuilder(entry_block, entry_block->begin());
+    for (const CommandNode& command : body.commands) {
+        if (!command.hasDeclaredType) continue;
+        llvm::Type* localType = resolveType(s, command.declaredType);
+        if (!localType) continue;
+        auto* slot = storageBuilder.CreateAlloca(localType, nullptr, command.targetRegister.name);
+        const auto naturalAlignment = function->getParent()->getDataLayout().getABITypeAlign(localType);
+        const unsigned requestedAlignment = command.declaredType.alignment > 0
+            ? static_cast<unsigned>(command.declaredType.alignment) : 0;
+        slot->setAlignment(llvm::Align(std::max<std::uint64_t>(
+            naturalAlignment.value(), requestedAlignment)));
+        s.localStorage[command.targetRegister.name] = slot;
+        // Every local has a defined initial value, even when control flow
+        // jumps past its declaration. A declaration initializer overwrites it
+        // when that command is reached.
+        storeValueWithZeroedPadding(storageBuilder,
+            llvm::Constant::getNullValue(localType), slot);
+    }
+
     if (args) {
         size_t idx = 0;
         for (auto& arg : function->args()) {
             const ArgNode& argNode = (*args)[idx];
             llvm::Type* argType = arg.getType();
             auto* slot = builder.CreateAlloca(argType, nullptr, argNode.name);
-            builder.CreateStore(&arg, slot);
+            storeValueWithZeroedPadding(builder, &arg, slot);
             s.locals[argNode.name] = slot;
             s.localTypes[argNode.name] = argNode.type;
             idx++;
@@ -1301,7 +2151,11 @@ void generateFunctionBody(State& s, const BlockNode& body, llvm::Function* funct
         const bool isLabel = command.hasInstruction && !command.instruction.isSpecial
             && command.instruction.name == "label";
         if (builder.GetInsertBlock()->getTerminator() && !isLabel) {
-            if (!command.isEmpty) psi::logError("instruction after a terminator requires a label");
+            if (!command.isEmpty) {
+                psi::DiagnosticLocationScope diagnosticLocation(command.location.line,
+                    command.location.column);
+                psi::logError("instruction after a terminator requires a label");
+            }
             continue;
         }
         processCommand(s, command, &builder);

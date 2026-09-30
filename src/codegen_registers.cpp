@@ -4,6 +4,8 @@
 #include <llvm/IR/IntrinsicsWebAssembly.h>
 #include <llvm/IR/IntrinsicsX86.h>
 
+#include <algorithm>
+
 namespace psi_codegen {
 
 llvm::Type* widthToType(RegisterWidth width, llvm::LLVMContext& context)
@@ -90,6 +92,8 @@ void addAArch64Registers(State& s)
     addRegister(s, "sp", RegisterWidth::I64);
     addRegister(s, "fp", RegisterWidth::I64);
     addRegister(s, "lr", RegisterWidth::I64);
+    addRegister(s, "xzr", RegisterWidth::I64);
+    addRegister(s, "wzr", RegisterWidth::I32);
 }
 
 void addARM32Registers(State& s)
@@ -117,6 +121,14 @@ void addRISCVRegisters(State& s, Architecture arch)
         s.specialRegisters[aliases[i]] = s.specialRegisters[name];
     }
     s.specialRegisters["fp"] = s.specialRegisters["x8"];
+
+    const bool hasD = targetFeatureEnabled(s.targetFeatures, "d");
+    const bool hasF = targetFeatureEnabled(s.targetFeatures, "f") || hasD;
+    if (hasF) {
+        const RegisterWidth floatWidth = hasD ? RegisterWidth::F64 : RegisterWidth::F32;
+        for (int i = 0; i < 32; ++i)
+            addRegister(s, "f" + std::to_string(i), floatWidth);
+    }
 }
 
 void addPowerPCRegisters(State& s, Architecture arch)
@@ -192,13 +204,17 @@ void addSystemRegisters(State& s, Architecture arch)
     }
     if (arch == Architecture::RISCV32 || arch == Architecture::RISCV64) {
         const auto width = arch == Architecture::RISCV64 ? RegisterWidth::I64 : RegisterWidth::I32;
-        add("cycle", width, "rdcycle $0");
-        add("time", width, "rdtime $0");
-        add("instret", width, "rdinstret $0");
-        if (arch == Architecture::RISCV32) {
-            add("cycleh", width, "rdcycleh $0");
-            add("timeh", width, "rdtimeh $0");
-            add("instreth", width, "rdinstreth $0");
+        const bool csrAvailable = !targetFeatureDisabled(s.targetFeatures, "zicsr");
+        const bool countersAvailable = !targetFeatureDisabled(s.targetFeatures, "zicntr");
+        if (csrAvailable && countersAvailable) {
+            add("cycle", width, "rdcycle $0");
+            add("time", width, "rdtime $0");
+            add("instret", width, "rdinstret $0");
+            if (arch == Architecture::RISCV32) {
+                add("cycleh", width, "rdcycleh $0");
+                add("timeh", width, "rdtimeh $0");
+                add("instreth", width, "rdinstreth $0");
+            }
         }
     }
     if (arch == Architecture::PPC32 || arch == Architecture::PPC64 || arch == Architecture::PPC64LE) {
@@ -230,6 +246,9 @@ void buildSpecialRegisterTable(State& s)
     case Architecture::ARM: addARM32Registers(s); break;
     default: break;
     }
+    // LLVMGeneric intentionally exposes no physical registers. A backend's
+    // register names and constraints must be modeled explicitly before PSI can
+    // promise their behavior.
     if (arch == Architecture::RISCV32 || arch == Architecture::RISCV64) addRISCVRegisters(s, arch);
     if (arch == Architecture::PPC32 || arch == Architecture::PPC64 || arch == Architecture::PPC64LE)
         addPowerPCRegisters(s, arch);
@@ -241,6 +260,111 @@ void buildSpecialRegisterTable(State& s)
     addSystemRegisters(s, arch);
 }
 
+namespace {
+
+bool isRegisterNumber(const std::string& name, char prefix)
+{
+    return name.size() > 1 && name[0] == prefix
+        && std::all_of(name.begin() + 1, name.end(),
+            [](unsigned char c) { return c >= '0' && c <= '9'; });
+}
+
+bool physicalRegisterReadAssembly(const State& s, const SpecialRegNode& reg,
+    RegisterWidth width, std::string& assembly, std::string& constraint)
+{
+    const Architecture arch = s.architecture;
+    const bool floating32 = width == RegisterWidth::F32;
+    const bool floating64 = width == RegisterWidth::F64;
+    if (arch == Architecture::X86 || arch == Architecture::X86_64) {
+        if (floating32) {
+            assembly = "movss %" + reg.name + ", $0";
+            constraint = "=x";
+        } else {
+            const char* suffix = width == RegisterWidth::I8 ? "b"
+                : width == RegisterWidth::I16 ? "w"
+                : width == RegisterWidth::I32 ? "l" : "q";
+            assembly = "mov" + std::string(suffix) + " %" + reg.name + ", $0";
+            constraint = width == RegisterWidth::I8 ? "=q" : "=r";
+        }
+        return true;
+    }
+    if (isARM32(arch)) {
+        if (floating32 || floating64) {
+            assembly = "vmov." + std::string(floating32 ? "f32 " : "f64 ")
+                + "$0, " + reg.name;
+            constraint = "=w";
+        } else {
+            assembly = "mov $0, " + reg.name;
+            constraint = "=r";
+        }
+        return true;
+    }
+    if (isAArch64(arch)) {
+        if (floating32 || floating64) {
+            assembly = "fmov $0, " + reg.name;
+            constraint = "=w";
+        } else {
+            assembly = "mov " + reg.name + ", " + reg.name;
+            // Keep the output in the named register's exact width. A generic
+            // GPR constraint can allocate the X alias for a W source (or vice
+            // versa), producing an invalid mixed-width MOV such as x30, w30.
+            // Spell the destination directly: LLVM canonicalizes a fixed W
+            // register output to its X register name when substituting `$0`.
+            const auto info = s.specialRegisters.find(reg.name);
+            if (info == s.specialRegisters.end()) return false;
+            constraint = "=" + info->second.constraint;
+        }
+        return true;
+    }
+    if (arch == Architecture::RISCV32 || arch == Architecture::RISCV64) {
+        assembly = "mv $0, " + reg.name;
+        constraint = "=r";
+        return true;
+    }
+    if (arch == Architecture::PPC32 || arch == Architecture::PPC64
+        || arch == Architecture::PPC64LE) {
+        std::string sourceRegister = reg.name;
+        if (sourceRegister.size() > 1
+            && (sourceRegister[0] == 'r' || sourceRegister[0] == 'f')
+            && std::all_of(sourceRegister.begin() + 1, sourceRegister.end(),
+                [](unsigned char c) { return c >= '0' && c <= '9'; }))
+            sourceRegister.erase(0, 1);
+        assembly = floating64 ? "fmr $0, " + sourceRegister
+                              : "mr $0, " + sourceRegister;
+        constraint = floating64 ? "=f" : "=r";
+        return true;
+    }
+    if (arch == Architecture::MIPS || arch == Architecture::MIPSEL
+        || arch == Architecture::MIPS64 || arch == Architecture::MIPS64EL) {
+        std::string sourceRegister = reg.name;
+        if (sourceRegister.size() > 1 && sourceRegister[0] == 'r'
+            && std::all_of(sourceRegister.begin() + 1, sourceRegister.end(),
+                [](unsigned char c) { return c >= '0' && c <= '9'; }))
+            sourceRegister.erase(0, 1);
+        assembly = "move $0, $$" + sourceRegister;
+        constraint = "=r";
+        return true;
+    }
+    if (arch == Architecture::LoongArch64) {
+        assembly = "move $0, $$" + reg.name;
+        constraint = "=r";
+        return true;
+    }
+    if (arch == Architecture::SystemZ) {
+        if (floating64) {
+            assembly = "ldr $0, %" + reg.name;
+            constraint = "=f";
+        } else {
+            assembly = "lgr $0, %" + reg.name;
+            constraint = "=r";
+        }
+        return true;
+    }
+    return false;
+}
+
+} // namespace
+
 llvm::Value* wasmMemorySize(State& s, llvm::IRBuilder<>* builder)
 {
     auto* word = builder->getIntNTy(s.architecture == Architecture::WASM64 ? 64 : 32);
@@ -251,6 +375,9 @@ llvm::Value* wasmMemorySize(State& s, llvm::IRBuilder<>* builder)
 
 llvm::Value* processSpecialRegisterRead(State& s, const SpecialRegNode& reg, llvm::IRBuilder<>* builder)
 {
+    if (isAArch64(s.architecture) && (reg.name == "xzr" || reg.name == "wzr"))
+        return llvm::ConstantInt::get(widthToType(
+            reg.name == "xzr" ? RegisterWidth::I64 : RegisterWidth::I32, *s.context), 0);
     if (reg.name == "mxcsr" && (s.architecture == Architecture::X86 || s.architecture == Architecture::X86_64)) {
         auto* slot = builder->CreateAlloca(builder->getInt32Ty());
         auto* fn = llvm::Intrinsic::getDeclaration(builder->GetInsertBlock()->getModule(), llvm::Intrinsic::x86_sse_stmxcsr);
@@ -264,14 +391,61 @@ llvm::Value* processSpecialRegisterRead(State& s, const SpecialRegNode& reg, llv
         return nullptr;
     }
 
+    if ((s.architecture == Architecture::RISCV32 || s.architecture == Architecture::RISCV64)
+        && isRegisterNumber(reg.name, 'f')) {
+        llvm::Type* floatType = widthToType(it->second.width, *s.context);
+        llvm::Value* slot = builder->CreateAlloca(floatType);
+        auto* transferType = llvm::FunctionType::get(llvm::Type::getVoidTy(*s.context),
+            {slot->getType()}, false);
+        const std::string transfer = (floatType->isFloatTy() ? "fsw " : "fsd ")
+            + reg.name + ", 0($0)";
+        auto* transferAsm = llvm::InlineAsm::get(transferType, transfer, "r,~{memory}", true);
+        builder->CreateCall(transferAsm, {slot});
+        auto* load = builder->CreateLoad(floatType, slot);
+        load->setAlignment(llvm::Align(1));
+        return load;
+    }
+
     llvm::Type* type = widthToType(it->second.width, *s.context);
     auto* asmType = llvm::FunctionType::get(type, false);
-    auto* asmFn = llvm::InlineAsm::get(asmType, it->second.readAsm, "=" + it->second.constraint, true);
+    std::string assembly = it->second.readAsm;
+    std::string constraints = "=" + it->second.constraint;
+    if (assembly.empty()) {
+        if (!physicalRegisterReadAssembly(s, reg, it->second.width, assembly, constraints)) {
+            psi::ErrorStream() << "reading '%" << reg.name
+                               << "' isn't implemented for this target\n";
+            return nullptr;
+        }
+    }
+    auto* asmFn = llvm::InlineAsm::get(asmType, assembly, constraints, true);
     return builder->CreateCall(asmFn);
 }
 
 void processSpecialRegisterWrite(State& s, const SpecialRegNode& reg, llvm::Value* value, llvm::IRBuilder<>* builder)
 {
+    if ((s.architecture == Architecture::RISCV32 || s.architecture == Architecture::RISCV64)
+        && isRegisterNumber(reg.name, 'f')) {
+        auto it = s.specialRegisters.find(reg.name);
+        if (it == s.specialRegisters.end()) {
+            psi::ErrorStream() << "'%" << reg.name << "' isn't an enabled RISC-V floating register for this target\n";
+            return;
+        }
+        llvm::Type* type = widthToType(it->second.width, *s.context);
+        if (value->getType() != type) {
+            psi::ErrorStream() << "can't write this value's type into '%" << reg.name << "'\n";
+            return;
+        }
+        llvm::Value* slot = builder->CreateAlloca(type);
+        auto* store = builder->CreateStore(value, slot);
+        store->setAlignment(llvm::Align(1));
+        auto* asmType = llvm::FunctionType::get(llvm::Type::getVoidTy(*s.context),
+            {slot->getType()}, false);
+        auto* asmFn = llvm::InlineAsm::get(asmType,
+            (type->isFloatTy() ? "flw " : "fld ") + reg.name + ", 0($0)",
+            "r,~{memory}", true);
+        builder->CreateCall(asmFn, {slot});
+        return;
+    }
     if (reg.name == "mxcsr" && (s.architecture == Architecture::X86 || s.architecture == Architecture::X86_64)) {
         if (!value->getType()->isIntegerTy()) {
             psi::ErrorStream() << "'%mxcsr' requires an integer\n";
@@ -285,6 +459,10 @@ void processSpecialRegisterWrite(State& s, const SpecialRegNode& reg, llvm::Valu
     }
     if (isWasm(s) && reg.name == "memory_pages") {
         psi::ErrorStream() << "'%memory_pages' is read-only; use #memory_grow\n";
+        return;
+    }
+    if (isAArch64(s.architecture) && (reg.name == "xzr" || reg.name == "wzr")) {
+        psi::ErrorStream() << "'%" << reg.name << "' is read-only\n";
         return;
     }
     auto it = s.specialRegisters.find(reg.name);
@@ -311,6 +489,19 @@ void processSpecialRegisterWrite(State& s, const SpecialRegNode& reg, llvm::Valu
             psi::ErrorStream() << "can't write this value's type into '%" << reg.name << "'\n";
             return;
         }
+    }
+
+    // A physical register write has no target-independent instruction text.
+    // Tie an empty-asm output to its input so LLVM must place the value in the
+    // requested register before the asm and treat that register as modified.
+    // This also preserves partial-register semantics through the target's
+    // fixed-register constraint.
+    if (it->second.readAsm.empty() && it->second.writeAsm.empty()) {
+        auto* asmType = llvm::FunctionType::get(type, { type }, false);
+        auto* asmFn = llvm::InlineAsm::get(asmType, "",
+            "=" + it->second.constraint + ",0", true);
+        builder->CreateCall(asmFn, { value });
+        return;
     }
 
     auto* asmType = llvm::FunctionType::get(llvm::Type::getVoidTy(*s.context), { type }, false);

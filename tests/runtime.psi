@@ -1,5 +1,6 @@
 i32 shared_value = 11;
-struct Pair { i32 left i32 right }
+struct Pair { i32 left; i32 right }
+struct Padded { u8 first; i32 second }
 func i32 host_increment i32 value;
 func i32 psi_add i32 a i32 b { i32 result = add a b; ret result; }
 func u32 psi_unsigned_shift u32 value { u32 result = rsh value 1; ret result; }
@@ -17,9 +18,22 @@ func i32 psi_sum i32 n {
     jmp loop;
 }
 func i32 psi_array {
-    i32* items = [3 5 7];
+    i32* items = [3, 5, 7];
     i32 result = add items[0] items[2];
     ret result;
+}
+func i32 psi_repeated_array_storage {
+    i32 iteration = 0;
+    i32* saved;
+    label loop;
+    i32* current = [iteration];
+    cjmp iteration done;
+    saved = current;
+    iteration = 1;
+    jmp loop;
+    label done;
+    current[0] = 7;
+    ret saved[0];
 }
 func i32 psi_struct {
     Pair pair;
@@ -28,12 +42,122 @@ func i32 psi_struct {
     i32 result = add pair.left pair.right;
     ret result;
 }
+func Padded psi_padding_identity Padded value { ret value; }
+func i32 psi_zero_structure_padding {
+    Padded original;
+    original.first = 7;
+    original.second = 11;
+    Padded copy = call psi_padding_identity original;
+    Padded* copy_pointer = ref copy;
+    store copy_pointer original;
+    u8* source = #ptrcast copy_pointer;
+    u8* bytes = [255, 255, 255, 255, 255, 255, 255, 255];
+    #memcpy bytes source 8;
+    i32 padding_sum = add bytes[1] bytes[2];
+    padding_sum = add padding_sum bytes[3];
+    padding_sum = add padding_sum bytes[5];
+    padding_sum = add padding_sum bytes[6];
+    padding_sum = add padding_sum bytes[7];
+    ret padding_sum;
+}
+func i32 psi_zero_local { i32 value; ret value; }
 func i32 psi_memory {
     i32 value = 7;
     i32* pointer = ref value;
-    store pointer 19;
+    i32 replacement = 19;
+    store pointer replacement;
     i32 result = load pointer;
     ret result;
+}
+func i32 psi_unaligned_memory {
+    u8* bytes = [0, 0, 0, 0, 0, 0, 0, 0];
+    u8* offset = add bytes 1;
+    i32* word = #ptrcast offset;
+    i32 word_value = 16909060;
+    store word word_value;
+    i32 value = load word;
+    ret value;
+}
+
+func i32 psi_pointer_arithmetic {
+    i32* items = [3, 5, 7];
+    void* opaque = items;
+    void** slot = ref opaque;
+    store slot items;
+    void* loaded = load slot;
+    i32* restored = loaded;
+    i32* second = add restored 1;
+    i32* third = add 1 second;
+    i32 distance = sub third restored;
+    i32 value = third[0];
+    i32 result = add value distance;
+    bool ordered = lt second third;
+    cjmp ordered success;
+    ret 0;
+    label success;
+    ret result;
+}
+
+func i32 psi_memory_intrinsics {
+    u8* source = [1, 2, 3, 4];
+    u8* destination = [0, 0, 0, 0];
+    #memcpy destination source 4;
+    #memset destination 9 1;
+    u8 first = destination[0];
+    u8 second = destination[1];
+    i32 sum = add first second;
+    ret sum;
+}
+func i32 psi_zero_length_memory {
+    #memcpy null null 0;
+    #memset null 255 0;
+    ret 42;
+}
+
+func i32 psi_explicit_casts i32 signed u8 unsigned {
+    i8 low = #trunc signed;
+    i32 restored = #sext low;
+    u32 widened = #zext unsigned;
+    f32 narrow_float = #fptrunc 1.5;
+    f64 wide_float = #fpext narrow_float;
+    i32 from_float = #fptosi 12.75;
+    u32 from_unsigned_float = #fptoui 2.5;
+    i32 result = add restored widened;
+    result = add result from_float;
+    result = add result from_unsigned_float;
+    ret result;
+}
+
+func i32 psi_float_to_int f64 value {
+    i32 result = #fptosi value;
+    ret result;
+}
+
+func i32 psi_overlapping_copy {
+    u8* bytes = [1, 2, 3, 4];
+    u8* start = ref bytes[0];
+    u8* destination = add start 1;
+    #memcpy destination start 3;
+    i32 result = add bytes[1] bytes[2];
+    ret result;
+}
+
+func i32 psi_atomic_cas {
+    i32 value = 4;
+    i32* pointer = ref value;
+    i32 expected = 4;
+    i32 desired = 9;
+    i32 old = #atomic_cas pointer expected desired;
+    i32 sum = add old value;
+    ret sum;
+}
+func f32 psi_atomic_fadd f32* pointer f32 value {
+    f32 old = #atomicfadd pointer value;
+    ret old;
+}
+func f64 psi_atomic_fsub f64* pointer f64 value {
+    f64 old = #atomicfsub pointer value;
+    ret old;
 }
 func i32 psi_external i32 value { i32 result = call host_increment value; ret result; }
 func i32 psi_global { ret shared_value; }
@@ -42,4 +166,73 @@ func f64 psi_float f64 value {
     f64 result = #fmul value factor;
     ret result;
 }
+func f32 psi_subnormal_add f32 a f32 b {
+    f32 result = #fadd a b;
+    ret result;
+}
+func f32 psi_subnormal_underflow f32 value {
+    f32 divisor = 2.0;
+    f32 result = div value divisor;
+    ret result;
+}
+func i32 psi_subnormal_compare f32 value {
+    bool equal = eq value 0.0;
+    i32 result = #zext equal;
+    ret result;
+}
+func u32 psi_subnormal_to_uint f32 value {
+    u32 result = #fptoui value;
+    ret result;
+}
 func i32 psi_popcount i32 value { i32 result = #popcnt value; ret result; }
+func i32 psi_view u64 index i32 replacement {
+    i32[] values = [4, 8, 15];
+    u64 length = #viewlen values;
+    #viewstore values index replacement;
+    i32 result = #viewload values index;
+    ret result;
+}
+func u64 psi_view_length {
+    i32[] values = [4, 8, 15];
+    u64 length = #viewlen values;
+    ret length;
+}
+func i32 psi_view_sum i32[] values {
+    i32 first = #viewload values 0;
+    i32 second = #viewload values 1;
+    i32 total = add first second;
+    ret total;
+}
+func i32 psi_view_call {
+    i32[] values = [19, 23];
+    i32 total = call psi_view_sum values;
+    ret total;
+}
+func i32 psi_view_slice {
+    i32[] values = [4, 8, 15, 16];
+    i32[] middle = #viewslice values 1 2;
+    i32 first = #viewload middle 0;
+    i32 second = #viewload middle 1;
+    i32 total = add first second;
+    ret total;
+}
+func u64 psi_empty_view_slice {
+    i32[] values = [4, 8, 15, 16];
+    i32[] empty = #viewslice values 4 0;
+    u64 length = #viewlen empty;
+    ret length;
+}
+func i32 psi_pointer_address_order {
+    i32 first_value = 1;
+    i32 second_value = 2;
+    i32* first = ref first_value;
+    i32* second = ref second_value;
+    bool forward = lt first second;
+    bool backward = lt second first;
+    bool distinct = neq first second;
+    bool ordered = lor forward backward;
+    bool complete = eq ordered distinct;
+    i32 result = #zext complete;
+    i64 cross_object_difference = sub first second;
+    ret result;
+}

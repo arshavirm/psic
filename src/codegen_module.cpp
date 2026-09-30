@@ -4,14 +4,221 @@
 #include <llvm/IR/DerivedTypes.h>
 #include <llvm/IR/GlobalVariable.h>
 #include <llvm/IR/Module.h>
+#include <llvm/IR/Instructions.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Target/TargetMachine.h>
 
+#include <algorithm>
 #include <stdexcept>
 #include <utility>
 
 namespace psi_codegen {
+
+void trapIfCondition(llvm::Value* condition, const char* blockPrefix,
+    llvm::IRBuilder<>* builder)
+{
+    llvm::Function* function = builder->GetInsertBlock()->getParent();
+    const std::string trapName = std::string(blockPrefix) + ".trap";
+    const std::string accessName = std::string(blockPrefix) + ".ok";
+    auto* trapBlock = llvm::BasicBlock::Create(builder->getContext(), trapName, function);
+    auto* accessBlock = llvm::BasicBlock::Create(builder->getContext(), accessName, function);
+    builder->CreateCondBr(condition, trapBlock, accessBlock);
+
+    builder->SetInsertPoint(trapBlock);
+    llvm::Function* trap = llvm::Intrinsic::getDeclaration(
+        builder->GetInsertBlock()->getModule(), llvm::Intrinsic::trap);
+    builder->CreateCall(trap);
+    builder->CreateUnreachable();
+    builder->SetInsertPoint(accessBlock);
+}
+
+void trapIfNullPointer(llvm::Value* pointer, llvm::IRBuilder<>* builder)
+{
+    trapIfCondition(builder->CreateIsNull(pointer), "null.access", builder);
+}
+
+void trapIfMisalignedPointer(llvm::Value* pointer, llvm::Align alignment,
+    llvm::IRBuilder<>* builder)
+{
+    if (alignment.value() == 1) return;
+    auto* pointerType = llvm::cast<llvm::PointerType>(pointer->getType());
+    const auto& layout = builder->GetInsertBlock()->getModule()->getDataLayout();
+    if (layout.isNonIntegralPointerType(pointerType))
+        throw std::runtime_error("atomic access on a non-integral pointer target cannot check alignment");
+
+    llvm::Type* integerType = builder->getIntNTy(layout.getPointerSizeInBits(pointerType->getAddressSpace()));
+    llvm::Value* address = builder->CreatePtrToInt(pointer, integerType, "atomic.address");
+    llvm::Value* mask = llvm::ConstantInt::get(integerType, alignment.value() - 1);
+    llvm::Value* misaligned = builder->CreateICmpNE(
+        builder->CreateAnd(address, mask), llvm::ConstantInt::get(integerType, 0));
+    trapIfCondition(misaligned, "atomic.alignment", builder);
+}
+
+void trapIfAddressRangeWraps(llvm::Value* pointer, llvm::Value* byteCount,
+    llvm::IRBuilder<>* builder)
+{
+    auto* pointerType = llvm::cast<llvm::PointerType>(pointer->getType());
+    const auto& layout = builder->GetInsertBlock()->getModule()->getDataLayout();
+    if (layout.isNonIntegralPointerType(pointerType))
+        throw std::runtime_error("memory range checks require an integral pointer representation");
+
+    const unsigned addressSpace = pointerType->getAddressSpace();
+    const unsigned pointerBits = layout.getPointerSizeInBits(addressSpace);
+    if (!byteCount->getType()->isIntegerTy())
+        throw std::runtime_error("memory range length must be an integer");
+    const unsigned lengthBits = byteCount->getType()->getIntegerBitWidth();
+    if (lengthBits > pointerBits) {
+        const llvm::APInt maxPointerLength = llvm::APInt::getMaxValue(pointerBits)
+            .zext(lengthBits);
+        llvm::Value* tooLarge = builder->CreateICmpUGT(byteCount,
+            llvm::ConstantInt::get(byteCount->getType(), maxPointerLength),
+            "memory.range.length.too_large");
+        trapIfCondition(tooLarge, "memory.range.length", builder);
+    }
+
+    llvm::Type* integerType = builder->getIntNTy(pointerBits);
+    llvm::Value* address = builder->CreatePtrToInt(pointer, integerType, "memory.address");
+    if (lengthBits < pointerBits)
+        byteCount = builder->CreateZExt(byteCount, integerType, "memory.range.length");
+    else if (lengthBits > pointerBits)
+        byteCount = builder->CreateTrunc(byteCount, integerType, "memory.range.length");
+    llvm::Value* endAddress = builder->CreateAdd(address, byteCount, "memory.range.end");
+    llvm::Value* wraps = builder->CreateICmpULT(endAddress, address, "memory.range.wraps");
+
+    trapIfCondition(wraps, "memory.range", builder);
+}
+
+void trapIfAccessRangeWraps(llvm::Value* pointer, llvm::Type* accessType,
+    llvm::IRBuilder<>* builder)
+{
+    const auto& layout = builder->GetInsertBlock()->getModule()->getDataLayout();
+    const auto allocationSize = layout.getTypeAllocSize(accessType);
+    if (allocationSize.isScalable())
+        throw std::runtime_error("memory range checks do not support scalable access types");
+    const auto* pointerType = llvm::cast<llvm::PointerType>(pointer->getType());
+    const unsigned pointerBits = layout.getPointerSizeInBits(pointerType->getAddressSpace());
+    const std::uint64_t size = allocationSize.getFixedValue();
+    if (pointerBits < 64 && size > ((std::uint64_t { 1 } << pointerBits) - 1)) {
+        // The byte count itself cannot be represented in the address space;
+        // converting it to intptr_t first would truncate it to a small value.
+        trapIfCondition(llvm::ConstantInt::getTrue(builder->getContext()),
+            "memory.range.length", builder);
+        return;
+    }
+    auto* pointerWidth = builder->getIntPtrTy(layout);
+    llvm::Value* byteCount = llvm::ConstantInt::get(pointerWidth, size);
+    trapIfAddressRangeWraps(pointer, byteCount, builder);
+}
+
+namespace {
+
+std::uint64_t fixedStoreSize(llvm::Type* type, llvm::IRBuilder<>& builder)
+{
+    const auto size = builder.GetInsertBlock()->getModule()->getDataLayout()
+        .getTypeAllocSize(type);
+    if (size.isScalable())
+        throw std::runtime_error("bytewise atomic memory access does not support scalable types");
+    return size.getFixedValue();
+}
+
+llvm::Value* byteAddress(llvm::IRBuilder<>& builder, llvm::Value* address,
+    std::uint64_t offset)
+{
+    llvm::Type* byteType = builder.getInt8Ty();
+    auto* pointerType = llvm::PointerType::get(byteType,
+        llvm::cast<llvm::PointerType>(address->getType())->getAddressSpace());
+    llvm::Value* bytes = builder.CreateBitCast(address, pointerType);
+    return builder.CreateGEP(byteType, bytes,
+        llvm::ConstantInt::get(builder.getIntPtrTy(
+            builder.GetInsertBlock()->getModule()->getDataLayout()), offset));
+}
+
+llvm::AllocaInst* createEntryAlloca(llvm::IRBuilder<>& builder, llvm::Type* type,
+    const llvm::Twine& name)
+{
+    llvm::Function* function = builder.GetInsertBlock()->getParent();
+    llvm::BasicBlock& entryBlock = function->getEntryBlock();
+    llvm::IRBuilder<> entryBuilder(builder.getContext());
+    auto insertionPoint = entryBlock.getFirstInsertionPt();
+    if (insertionPoint == entryBlock.end()) entryBuilder.SetInsertPoint(&entryBlock);
+    else entryBuilder.SetInsertPoint(&entryBlock, insertionPoint);
+    auto* result = entryBuilder.CreateAlloca(type, nullptr, name);
+    result->setAlignment(llvm::Align(1));
+    return result;
+}
+
+void atomicStoreByte(llvm::IRBuilder<>& builder, llvm::Value* address,
+    llvm::Value* value)
+{
+    auto* store = builder.CreateStore(value, address);
+    store->setAlignment(llvm::Align(1));
+    store->setAtomic(llvm::AtomicOrdering::SequentiallyConsistent);
+}
+
+} // namespace
+
+llvm::Value* loadValueBytewiseAtomic(llvm::IRBuilder<>& builder, llvm::Type* type,
+    llvm::Value* address)
+{
+    const std::uint64_t size = fixedStoreSize(type, builder);
+    llvm::AllocaInst* temporary = createEntryAlloca(builder, type, "atomic.bytes.tmp");
+    for (std::uint64_t index = 0; index < size; ++index) {
+        llvm::LoadInst* byte = builder.CreateLoad(builder.getInt8Ty(),
+            byteAddress(builder, address, index), "atomic.byte.load");
+        byte->setAlignment(llvm::Align(1));
+        byte->setAtomic(llvm::AtomicOrdering::SequentiallyConsistent);
+        atomicStoreByte(builder, byteAddress(builder, temporary, index), byte);
+    }
+    llvm::LoadInst* result = builder.CreateLoad(type, temporary, "atomic.bytes.value");
+    result->setAlignment(llvm::Align(1));
+    return result;
+}
+
+void storeValueBytewiseAtomic(llvm::IRBuilder<>& builder, llvm::Value* value,
+    llvm::Value* address)
+{
+    llvm::Type* type = value->getType();
+    const std::uint64_t size = fixedStoreSize(type, builder);
+    llvm::AllocaInst* temporary = createEntryAlloca(builder, type, "atomic.bytes.tmp");
+    builder.CreateMemSet(temporary, builder.getInt8(0),
+        llvm::ConstantInt::get(builder.getIntPtrTy(
+            builder.GetInsertBlock()->getModule()->getDataLayout()), size),
+        llvm::MaybeAlign(1));
+    auto* initialStore = builder.CreateStore(value, temporary);
+    initialStore->setAlignment(llvm::Align(1));
+    for (std::uint64_t index = 0; index < size; ++index) {
+        llvm::LoadInst* byte = builder.CreateLoad(builder.getInt8Ty(),
+            byteAddress(builder, temporary, index), "atomic.byte.value");
+        byte->setAlignment(llvm::Align(1));
+        atomicStoreByte(builder, byteAddress(builder, address, index), byte);
+    }
+}
+
+void storeValueWithZeroedPadding(llvm::IRBuilder<>& builder, llvm::Value* value,
+    llvm::Value* address)
+{
+    auto* structure = llvm::dyn_cast<llvm::StructType>(value->getType());
+    if (!structure) {
+        storeValueBytewiseAtomic(builder, value, address);
+        return;
+    }
+
+    llvm::Module* module = builder.GetInsertBlock()->getModule();
+    const auto size = module->getDataLayout().getTypeAllocSize(structure);
+    for (std::uint64_t offset = 0; offset < size.getFixedValue(); ++offset)
+        atomicStoreByte(builder, byteAddress(builder, address, offset), builder.getInt8(0));
+
+    for (unsigned index = 0; index < structure->getNumElements(); ++index) {
+        llvm::Value* fieldAddress = builder.CreateStructGEP(structure, address, index);
+        llvm::Value* fieldValue = builder.CreateExtractValue(value, index);
+        if (fieldValue->getType()->isStructTy()) {
+            storeValueWithZeroedPadding(builder, fieldValue, fieldAddress);
+        } else {
+            storeValueBytewiseAtomic(builder, fieldValue, fieldAddress);
+        }
+    }
+}
 
 llvm::Type* resolveType(State& s, const TypeNode& type)
 {
@@ -23,6 +230,10 @@ llvm::Type* resolveType(State& s, const TypeNode& type)
     llvm::Type* result = it->second;
     for (int i = 0; i < type.pointerLevel; i++) {
         result = result->getPointerTo();
+    }
+    if (type.isView) {
+        auto* lengthType = llvm::Type::getInt64Ty(*s.context);
+        result = llvm::StructType::get(*s.context, {result->getPointerTo(), lengthType});
     }
     return result;
 }
@@ -56,16 +267,21 @@ llvm::Constant* buildConstant(State& s, const ValueNode* value, const TypeNode& 
     switch (value->kind) {
     case ValueKind::Number: {
         if (targetType->isFloatingPointTy()) {
-            const double number = value->numberIsFloat
-                ? value->numberAsFloat : static_cast<double>(value->numberAsInt);
-            return llvm::ConstantFP::get(targetType, number);
+            if (!value->numberIsFloat) {
+                psi::logError("integer literal cannot initialize a floating-point global; use a floating-point literal");
+                return nullptr;
+            }
+            return llvm::ConstantFP::get(targetType, value->numberAsFloat);
         }
         if (!targetType->isIntegerTy()) {
             psi::logError("numeric global initializer requires an integer or floating type");
             return nullptr;
         }
-        const long long integer = value->numberIsFloat
-            ? static_cast<long long>(value->numberAsFloat) : value->numberAsInt;
+        long long integer = value->numberAsInt;
+        if (value->numberIsFloat) {
+            psi::logError("floating-point literal cannot initialize an integer global; use an explicit conversion in a function body");
+            return nullptr;
+        }
         return llvm::ConstantInt::get(targetType, static_cast<uint64_t>(integer), true);
     }
     case ValueKind::String:
@@ -179,7 +395,8 @@ const TypeNode* findRegisterType(const State& state, const std::string& name)
 
 } // namespace
 
-RegisterAddress resolveRegisterAddress(State& s, const RegNode& reg, llvm::IRBuilder<>* builder)
+RegisterAddress resolveRegisterAddress(State& s, const RegNode& reg,
+    llvm::IRBuilder<>* builder, bool dereferenceFinal)
 {
     RegisterAddress result;
 
@@ -206,7 +423,9 @@ RegisterAddress resolveRegisterAddress(State& s, const RegNode& reg, llvm::IRBui
     }
     currentType = *registerType;
 
-    for (const auto& accessor : reg.accessors) {
+    bool addressMayBeNull = false;
+    for (std::size_t accessorIndex = 0; accessorIndex < reg.accessors.size(); ++accessorIndex) {
+        const auto& accessor = reg.accessors[accessorIndex];
         const TypeNode typeBefore = currentType;
         if (!stepAccessorTypeNode(s, reg, currentType, accessor, true)) {
             return {};
@@ -217,14 +436,34 @@ RegisterAddress resolveRegisterAddress(State& s, const RegNode& reg, llvm::IRBui
             if (!structLlvmType) {
                 return {};
             }
-            address = builder->CreateStructGEP(structLlvmType, address,
-                (unsigned)s.structFieldIndex.at(typeBefore.baseName).at(accessor.fieldName));
+            llvm::Value* fieldIndices[] = {
+                builder->getInt32(0),
+                builder->getInt32(static_cast<unsigned>(
+                    s.structFieldIndex.at(typeBefore.baseName).at(accessor.fieldName))),
+            };
+            // `ref` may form an address from a null base without dereferencing
+            // it. CreateStructGEP is inbounds and would turn that defined
+            // address calculation into poison, so use a plain GEP here.
+            address = builder->CreateGEP(structLlvmType, address, fieldIndices);
         } else {
+            // Loading the next pointer in an accessor chain is a memory
+            // access through the address computed by the previous step.
+            if (addressMayBeNull) trapIfNullPointer(address, builder);
             llvm::Type* pointerLlvmType = resolveType(s, TypeNode { currentType.baseName, currentType.pointerLevel + 1 });
             if (!pointerLlvmType) {
                 return {};
             }
-            llvm::Value* pointerValue = builder->CreateLoad(pointerLlvmType, address);
+            trapIfAccessRangeWraps(address, pointerLlvmType, builder);
+            llvm::Value* pointerValue = loadValueBytewiseAtomic(
+                *builder, pointerLlvmType, address);
+
+            const bool laterPointerLoad = std::any_of(
+                reg.accessors.begin() + accessorIndex + 1, reg.accessors.end(),
+                [](const AccessorNode& later) { return later.kind == AccessorKind::Index; });
+            // A null base stays invalid even when adding a nonzero element
+            // offset would produce a non-null address bit pattern.
+            if (dereferenceFinal || laterPointerLoad)
+                trapIfNullPointer(pointerValue, builder);
 
             llvm::Type* elementLlvmType = resolveType(s, currentType);
             if (!elementLlvmType) {
@@ -232,6 +471,7 @@ RegisterAddress resolveRegisterAddress(State& s, const RegNode& reg, llvm::IRBui
             }
 
             address = builder->CreateGEP(elementLlvmType, pointerValue, builder->getInt32(accessor.index));
+            addressMayBeNull = true;
         }
     }
 
@@ -436,6 +676,8 @@ void declareFunctionsAndGlobals(State& state, const ProgramNode& program,
     llvm::LLVMContext& context, llvm::Module& module)
 {
     for (const auto& declaration : program.declarations) {
+        psi::DiagnosticLocationScope diagnosticLocation(
+            declaration.location.line, declaration.location.column);
         if (declaration.kind == DeclKind::Func) {
             const auto& function = declaration.funcDecl;
             if (state.functionDeclarations.count(function.name)) continue;
@@ -490,6 +732,8 @@ void declareFunctionsAndGlobals(State& state, const ProgramNode& program,
 void generateProgramBodies(State& state, const ProgramNode& program, llvm::Module& module)
 {
     for (const auto& declaration : program.declarations) {
+        psi::DiagnosticLocationScope diagnosticLocation(
+            declaration.location.line, declaration.location.column);
         if (declaration.kind == DeclKind::Entry) {
             const std::string& entryName = declaration.entryDecl.name;
             if (state.functionDeclarations.count(entryName)) {
@@ -514,7 +758,8 @@ void generateProgramBodies(State& state, const ProgramNode& program, llvm::Modul
 
 } // namespace
 
-std::string compileProgram(std::string name, ProgramNode program, Architecture arch, OperatingSystem os, const std::string& targetTriple)
+std::string compileProgram(std::string name, ProgramNode program, Architecture arch, OperatingSystem os,
+    const std::string& targetTriple, const std::string& targetCPU, const std::string& targetFeatures)
 {
     psi::resetErrors();
 
@@ -524,24 +769,31 @@ std::string compileProgram(std::string name, ProgramNode program, Architecture a
     s.context = &context;
     s.architecture = arch;
     s.os = os;
-    buildSpecialRegisterTable(s);
+    s.targetFeatures = targetFeatures;
 
     llvm::Module module(name, context);
-    const std::string defaultTarget = defaultTriple(arch, os);
-    module.setTargetTriple(targetTriple.empty() ? defaultTarget : targetTriple);
+    module.setTargetTriple(targetTriple.empty() ? defaultTriple(arch, os) : targetTriple);
+    s.targetTriple = module.getTargetTriple();
     std::string targetError;
-    auto targetMachine = buildTargetMachine(module.getTargetTriple(), targetError);
+    auto targetMachine = buildTargetMachine(module.getTargetTriple(), targetError, targetCPU, targetFeatures);
     if (!targetMachine) throw std::runtime_error(targetError);
+    // Resolve CPU defaults and explicit overrides for feature-gated registers.
+    s.targetFeatures = resolvedTargetFeatures(s.targetTriple, targetCPU,
+        targetMachine->getTargetFeatureString().str());
     module.setDataLayout(targetMachine->createDataLayout());
+    buildSpecialRegisterTable(s);
 
     declareBuiltinTypes(s, context);
     declareStructTypes(s, program, context);
     declareFunctionsAndGlobals(s, program, context, module);
     generateProgramBodies(s, program, module);
 
-    // Preserve baseline ISA requirements when users pass emitted IR to LLVM tools.
+    // Preserve the selected subtarget when users pass emitted IR to LLVM tools.
     for (auto& function : module) {
-        if (!function.isDeclaration() && !targetMachine->getTargetFeatureString().empty())
+        if (function.isDeclaration()) continue;
+        if (!targetMachine->getTargetCPU().empty())
+            function.addFnAttr("target-cpu", targetMachine->getTargetCPU());
+        if (!targetMachine->getTargetFeatureString().empty())
             function.addFnAttr("target-features", targetMachine->getTargetFeatureString());
     }
 

@@ -22,7 +22,28 @@ static bool isLetterOrDigitChar(char c)
     return isLetterChar(c) || isDigitChar(c);
 }
 
-Lexer::Lexer(const std::string& sourceCode)
+static std::size_t utf8SequenceLength(std::string_view text, std::size_t offset)
+{
+    const std::size_t remaining = text.size() - offset;
+    const auto first = static_cast<unsigned char>(text[offset]);
+    const std::size_t length = first >= 0xF0 && first <= 0xF4 ? 4
+        : first >= 0xE0 && first <= 0xEF ? 3
+        : first >= 0xC2 && first <= 0xDF ? 2 : 1;
+    if (length == 1 || length > remaining) return 1;
+
+    for (std::size_t index = 1; index < length; ++index) {
+        const auto continuation = static_cast<unsigned char>(text[offset + index]);
+        if ((continuation & 0xC0) != 0x80) return 1;
+        if (index == 1 && ((first == 0xE0 && continuation < 0xA0)
+                || (first == 0xED && continuation >= 0xA0)
+                || (first == 0xF0 && continuation < 0x90)
+                || (first == 0xF4 && continuation >= 0x90)))
+            return 1;
+    }
+    return length;
+}
+
+Lexer::Lexer(std::string_view sourceCode)
     : source(sourceCode)
 {}
 
@@ -46,13 +67,29 @@ char Lexer::lookAheadChar()
 
 char Lexer::readChar()
 {
+    const std::size_t byteOffset = position;
     char c = source[position];
     ++position;
-    if (c == '\n') {
+    if (c == '\r') {
         ++line;
         column = 1;
+        utf8ContinuationBytes = 0;
+        previousWasCarriageReturn = true;
+    } else if (c == '\n') {
+        if (!previousWasCarriageReturn) ++line;
+        column = 1;
+        utf8ContinuationBytes = 0;
+        previousWasCarriageReturn = false;
     } else {
-        ++column;
+        const auto byte = static_cast<unsigned char>(c);
+        if (utf8ContinuationBytes != 0 && (byte & 0xC0) == 0x80) {
+            --utf8ContinuationBytes;
+        } else {
+            utf8ContinuationBytes = 0;
+            ++column;
+            utf8ContinuationBytes = utf8SequenceLength(source, byteOffset) - 1;
+        }
+        previousWasCarriageReturn = false;
     }
     return c;
 }
@@ -75,7 +112,7 @@ void Lexer::skipWhitespaceAndComments()
             readChar();
             readChar();
 
-            while (!isAtEnd() && currentChar() != '\n') {
+            while (!isAtEnd() && currentChar() != '\n' && currentChar() != '\r') {
                 readChar();
             }
             continue;
@@ -83,6 +120,7 @@ void Lexer::skipWhitespaceAndComments()
 
         if (c == '/' && lookAheadChar() == '*') {
             const int startLine = line;
+            const int startColumn = column;
             bool closed = false;
             readChar();
             readChar();
@@ -95,7 +133,8 @@ void Lexer::skipWhitespaceAndComments()
                 }
                 readChar();
             }
-            if (!closed) throw std::runtime_error("unterminated block comment at line " + std::to_string(startLine));
+            if (!closed) throw LocatedSourceError("unterminated block comment",
+                {static_cast<std::size_t>(startLine), static_cast<std::size_t>(startColumn)});
             continue;
         }
 
@@ -130,10 +169,17 @@ Token Lexer::readNumber()
         text += readChar();
         text += readChar();
         if (!isHexDigitChar(currentChar()))
-            throw std::runtime_error("expected hexadecimal digits at line " + std::to_string(startLine));
+            throw LocatedSourceError("expected hexadecimal digits",
+                {static_cast<std::size_t>(startLine), static_cast<std::size_t>(startColumn)});
         while (!isAtEnd() && isHexDigitChar(currentChar())) {
             text += readChar();
         }
+    } else if (currentChar() == '0' && (lookAheadChar() == 'o' || lookAheadChar() == 'O')) {
+        text += readChar(); text += readChar();
+        if (currentChar() < '0' || currentChar() > '7')
+            throw LocatedSourceError("expected octal digits",
+                {static_cast<std::size_t>(startLine), static_cast<std::size_t>(startColumn)});
+        while (!isAtEnd() && currentChar() >= '0' && currentChar() <= '7') text += readChar();
     } else {
         while (!isAtEnd() && isDigitChar(currentChar())) {
             text += readChar();
@@ -171,7 +217,8 @@ Token Lexer::readString()
     }
 
     if (!closed)
-        throw std::runtime_error("unterminated string literal starting at line " + std::to_string(startLine));
+        throw LocatedSourceError("unterminated string literal",
+            {static_cast<std::size_t>(startLine), static_cast<std::size_t>(startColumn)});
 
     return makeToken(TokenType::String, std::move(text), startLine, startColumn);
 }
@@ -184,7 +231,8 @@ Token Lexer::readSpecialToken(char marker, TokenType type)
     text += readChar();
 
     if (!isLetterChar(currentChar())) {
-        throw std::runtime_error(std::string("expected a name right after '") + marker + "' at line " + std::to_string(startLine));
+        throw LocatedSourceError(std::string("expected a name right after '") + marker + "'",
+            {static_cast<std::size_t>(startLine), static_cast<std::size_t>(startColumn)});
     }
     while (!isAtEnd()) {
         if (isLetterOrDigitChar(currentChar())) {
@@ -267,8 +315,12 @@ std::vector<Token> Lexer::tokenize()
         case ';':
             type = TokenType::Semicolon;
             break;
+        case ',':
+            type = TokenType::Comma;
+            break;
         default:
-            throw std::runtime_error(std::string("unexpected character '") + c + "' at line " + std::to_string(startLine));
+            throw LocatedSourceError(std::string("unexpected character '") + c + "'",
+                {static_cast<std::size_t>(startLine), static_cast<std::size_t>(startColumn)});
         }
 
         tokens.push_back(makeToken(type, std::string(1, c), startLine, startColumn));

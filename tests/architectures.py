@@ -65,6 +65,10 @@ for arch in TARGETS:
         compile_source(arch, '#nop; u32 n = #clz 1; u32 p = #popcnt n;', options=[opt])
         compile_source(arch, 'f32 a = 1.0; f32 b = 2.0; f32 c = #fadd a b;', options=[opt])
     compile_source(arch,
+        'func u64 runtime_index; entry main { i32[] values = [4, 8, 15]; '
+        'u64 index = call runtime_index; i32 old = #viewload values index; '
+        '#viewstore values index old; ret; }', raw=True)
+    compile_source(arch,
         'func i32 core_ops i32 a i32 b { i32 q = div a b; i32 s = lsh a b; i32 sum = add q s; ret sum; }',
         raw=True)
 
@@ -83,8 +87,19 @@ INSTRUCTIONS = {
 }
 for arch, instructions in INSTRUCTIONS.items():
     for instruction in instructions:
-        compile_source(arch, f'#{instruction};')
-        compile_source(arch, f'#{instruction} 1;', error='takes no operands')
+        options = ['--features', '+zifencei'] if instruction in ('fence_i', 'fence.i') else []
+        compile_source(arch, f'#{instruction};', options=options)
+        compile_source(arch, f'#{instruction} 1;', options=options, error='takes no operands')
+
+for arch in ('riscv32', 'riscv64'):
+    compile_source(arch, '#fence.i;', error='requires the Zifencei target feature')
+
+# New target-specific x86 port/interrupt instructions must compile on x86 and
+# fail clearly on targets that do not implement PC I/O/interrupt controls.
+for arch in ('x86', 'x86_64'):
+    compile_source(arch, 'u8 value = #inb 0x80; #outb 0x80 value; #hlt; #cli; #sti;')
+for arch in ('wasm32', 'aarch64', 'riscv64'):
+    compile_source(arch, 'u8 value = #inb 0x80;', error='requires an x86 target')
 
 REGISTERS = {
     'x86': ['eax', 'xmm0', 'mxcsr'],
@@ -101,7 +116,8 @@ REGISTERS = {
 }
 for arch, registers in REGISTERS.items():
     for register in registers:
-        ty = 'f32' if register.startswith('xmm') else 'f64' if register == 'f0' else 'u64'
+        ty = ('f32' if register.startswith('xmm') else 'f64' if register == 'f0'
+              else 'u32' if arch == 'aarch64' and register.startswith('w') else 'u64')
         compile_source(arch, f'{ty} value = %{register}; %{register} = value;')
 
 READ_ONLY = {
@@ -113,8 +129,12 @@ READ_ONLY = {
 }
 for arch, registers in READ_ONLY.items():
     for register in registers:
-        compile_source(arch, f'u64 value = %{register};')
-        compile_source(arch, f'%{register} = 1;', error='read-only')
+        options = (['--features', '+zicsr,+zicntr']
+                   if arch.startswith('riscv') and register in {
+                       'cycle', 'time', 'instret', 'cycleh', 'timeh', 'instreth'
+                   } else [])
+        compile_source(arch, f'u64 value = %{register};', options=options)
+        compile_source(arch, f'%{register} = 1;', options=options, error='read-only')
 
 for arch, bits in [('wasm32', 32), ('wasm64', 64)]:
     for opt in ['-O0', '-O2']:
@@ -128,24 +148,29 @@ for arch, bits in [('wasm32', 32), ('wasm64', 64)]:
     compile_source(arch, '#memory_grow;', error='operand count')
     compile_source(arch, '#memory_grow 1.0;', error='integer page count')
     compile_source(arch, '%rax = 0;', error="isn't a recognized register")
-    compile_source(arch, '#syscall 1;', error='only the Linux')
-    compile_source(arch, '', options=['-mos', 'linux'], error='requires OS none or wasi')
+    compile_source(arch, '#syscall 1;', error='available only for supported Linux target profiles')
+    compile_source(arch, '', options=['-mos', 'linux'],
+                   error='unsupported architecture/OS profile combination')
 
 for arch in ['x86', 'x86_64', 'arm', 'aarch64', 'riscv32', 'riscv64']:
     compile_source(arch, 'u64 result = #syscall 1 2 3 4 5 6 7;')
-    compile_source(arch, '#syscall 1;', options=['-mos', 'none'], error='only the Linux')
+    compile_source(arch, '#syscall 1;', options=['-mos', 'none'],
+                   error='available only for supported Linux target profiles')
 
 compile_source('x86_64', 'u64 tick = #rdtsc;')
 compile_source('x86_64', '#rdtsc 1;', error='takes no operands')
 compile_source('x86_64', '#memory_size;', error='requires WebAssembly')
-compile_source('x86_64', '#syscall 1;', options=['-mos', 'windows'], error='only the Linux')
-compile_source('aarch64', '#pause;', error='only available on x86')
-compile_source('riscv64', '#yield;', error='only available on ARM')
-compile_source('wasm32', '#dmb;', error='unsupported special instruction')
+compile_source('x86_64', '#syscall 1;', options=['-mos', 'windows'],
+               error='available only for supported Linux target profiles')
+compile_source('aarch64', '#pause;', error='unavailable on the selected target')
+compile_source('riscv64', '#yield;', error='unavailable on the selected target')
+compile_source('wasm32', '#dmb;', error='unavailable on the selected target')
 compile_source('x86_64', '', options=['-target', 'wasm32-unknown-unknown'], error='architecture conflicts')
 compile_source('wasm32', '', options=['-target', 'wasm32-unknown-wasi', '-mos', 'none'], error='OS conflicts')
-compile_source('riscv64', '', options=['-mos', 'darwin'], error='supports Linux or freestanding')
-compile_source('x86_64', '', options=['-mos', 'wasi'], error='WASI requires WebAssembly')
+compile_source('riscv64', '', options=['-mos', 'darwin'],
+               error='unsupported architecture/OS profile combination')
+compile_source('x86_64', '', options=['-mos', 'wasi'],
+               error='unsupported architecture/OS profile combination')
 for arch, triple in [('wasm32', 'wasm32-unknown-wasi'), ('riscv64', 'riscv64-unknown-none-elf'),
                      ('x86_64', 'x86_64-pc-linux-gnu')]:
     ir = compile_source(arch, '', options=['-target', triple], ir=True)

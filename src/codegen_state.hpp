@@ -13,6 +13,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace psi_codegen {
@@ -40,6 +41,8 @@ struct State {
     llvm::LLVMContext* context = nullptr;
     Architecture architecture = Architecture::X86_64;
     OperatingSystem os = OperatingSystem::Linux;
+    std::string targetTriple;
+    std::string targetFeatures;
 
     llvm::Function* currentFunction = nullptr;
     TypeNode currentFunctionReturnType;
@@ -56,6 +59,7 @@ struct State {
     std::unordered_map<std::string, std::vector<TypeNode>> structFieldTypes;
 
     std::unordered_map<std::string, llvm::Value*> locals;
+    std::unordered_map<std::string, llvm::Value*> localStorage;
     std::unordered_map<std::string, TypeNode> localTypes;
     std::unordered_map<std::string, llvm::BasicBlock*> labels;
     std::vector<std::string> declaredLocalNames;
@@ -81,7 +85,23 @@ struct RegisterAddress {
     llvm::Value* address = nullptr;
     TypeNode typeNode;
 };
-RegisterAddress resolveRegisterAddress(State& s, const RegNode& reg, llvm::IRBuilder<>* builder);
+void storeValueWithZeroedPadding(llvm::IRBuilder<>& builder, llvm::Value* value,
+    llvm::Value* address);
+llvm::Value* loadValueBytewiseAtomic(llvm::IRBuilder<>& builder, llvm::Type* type,
+    llvm::Value* address);
+void storeValueBytewiseAtomic(llvm::IRBuilder<>& builder, llvm::Value* value,
+    llvm::Value* address);
+void trapIfCondition(llvm::Value* condition, const char* blockPrefix,
+    llvm::IRBuilder<>* builder);
+void trapIfNullPointer(llvm::Value* pointer, llvm::IRBuilder<>* builder);
+void trapIfMisalignedPointer(llvm::Value* pointer, llvm::Align alignment,
+    llvm::IRBuilder<>* builder);
+void trapIfAddressRangeWraps(llvm::Value* pointer, llvm::Value* byteCount,
+    llvm::IRBuilder<>* builder);
+void trapIfAccessRangeWraps(llvm::Value* pointer, llvm::Type* accessType,
+    llvm::IRBuilder<>* builder);
+RegisterAddress resolveRegisterAddress(State& s, const RegNode& reg,
+    llvm::IRBuilder<>* builder, bool dereferenceFinal = true);
 bool resolveRegisterTypeNode(const State& s, const RegNode& reg, TypeNode& outType);
 bool isDeclaredUnsigned(const State& s, const ValueNode& value);
 
@@ -103,7 +123,8 @@ void generateFunctionBody(State& s, const BlockNode& body, llvm::Function* funct
     const std::vector<ArgNode>* args, const std::string& diagnosticName);
 
 // --- codegen.cpp (target / emission) ---
-std::unique_ptr<llvm::TargetMachine> buildTargetMachine(const std::string& triple, std::string& errorMessage);
+std::unique_ptr<llvm::TargetMachine> buildTargetMachine(const std::string& triple, std::string& errorMessage,
+    const std::string& cpu = "", const std::string& requestedFeatures = "");
 
 // Installs the handler that routes LLVM diagnostics into the psi log.
 void setCodegenDiagnosticHandler(llvm::LLVMContext& context);

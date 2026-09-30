@@ -1,31 +1,25 @@
 #include "target.hpp"
 #include <llvm/TargetParser/Triple.h>
+#include <algorithm>
 #include <stdexcept>
 #include <utility>
+
+std::string normalizeTargetTriple(const std::string& targetTriple)
+{
+    return llvm::Triple::normalize(targetTriple);
+}
 
 Architecture pickArchitecture(const std::string& explicitArch,
     const std::string& targetTriple)
 {
-    static const std::pair<const char*, Architecture> names[] = {
-        {"x86", Architecture::X86}, {"i386", Architecture::X86},
-        {"i486", Architecture::X86}, {"i586", Architecture::X86}, {"i686", Architecture::X86},
-        {"x86_64", Architecture::X86_64}, {"x86-64", Architecture::X86_64}, {"amd64", Architecture::X86_64},
-        {"arm", Architecture::ARM}, {"armv7", Architecture::ARM}, {"armv7a", Architecture::ARM},
-        {"thumbv7", Architecture::ARM}, {"thumbv7a", Architecture::ARM},
-        {"aarch64", Architecture::AArch64}, {"arm64", Architecture::AArch64},
-        {"wasm", Architecture::WASM32}, {"wasm32", Architecture::WASM32}, {"wasm64", Architecture::WASM64},
-        {"riscv32", Architecture::RISCV32}, {"riscv64", Architecture::RISCV64},
-        {"ppc", Architecture::PPC32}, {"powerpc", Architecture::PPC32},
-        {"ppc64", Architecture::PPC64}, {"powerpc64", Architecture::PPC64},
-        {"ppc64le", Architecture::PPC64LE}, {"powerpc64le", Architecture::PPC64LE},
-        {"mips", Architecture::MIPS}, {"mipsel", Architecture::MIPSEL},
-        {"mips64", Architecture::MIPS64}, {"mips64el", Architecture::MIPS64EL},
-        {"loongarch64", Architecture::LoongArch64}, {"s390x", Architecture::SystemZ},
-        {"systemz", Architecture::SystemZ}
-    };
     auto parse = [&](const std::string& name) {
-        for (const auto& item : names)
-            if (name == item.first) return item.second;
+        const std::string_view requestedName(name);
+        for (const ArchitectureNameGroup& group : architectureNameGroups()) {
+            if (requestedName == group.canonical
+                || std::find(group.aliases.begin(), group.aliases.end(), requestedName)
+                    != group.aliases.end())
+                return group.architecture;
+        }
         throw std::runtime_error("unknown architecture '" + name + "'");
     };
     auto parseTriple = [&]() {
@@ -49,7 +43,10 @@ Architecture pickArchitecture(const std::string& explicitArch,
         case llvm::Triple::mips64el: return Architecture::MIPS64EL;
         case llvm::Triple::loongarch64: return Architecture::LoongArch64;
         case llvm::Triple::systemz: return Architecture::SystemZ;
-        default: throw std::runtime_error("unsupported architecture in target triple '" + targetTriple + "'");
+        default:
+            if (triple.getArch() != llvm::Triple::UnknownArch)
+                return Architecture::LLVMGeneric;
+            throw std::runtime_error("unsupported architecture in target triple '" + targetTriple + "'");
         }
     };
     if (!explicitArch.empty()) {
@@ -64,25 +61,14 @@ Architecture pickArchitecture(const std::string& explicitArch,
 OperatingSystem pickOperatingSystem(const std::string& explicitOs,
     const std::string& targetTriple)
 {
-    if (explicitOs == "wasi") return OperatingSystem::WASI;
-
-    if (explicitOs == "linux") {
-        return OperatingSystem::Linux;
-    }
-
-    if (explicitOs == "darwin" || explicitOs == "macos" || explicitOs == "macosx") {
-        return OperatingSystem::Darwin;
-    }
-
-    if (explicitOs == "windows" || explicitOs == "win32") {
-        return OperatingSystem::Windows;
-    }
-
-    if (explicitOs == "none" || explicitOs == "freestanding" || explicitOs == "bare-metal") {
-        return OperatingSystem::FreeStanding;
-    }
-
     if (!explicitOs.empty()) {
+        const std::string_view requestedName(explicitOs);
+        for (const OperatingSystemNameGroup& group : operatingSystemNameGroups()) {
+            if (requestedName == group.canonical
+                || std::find(group.aliases.begin(), group.aliases.end(), requestedName)
+                    != group.aliases.end())
+                return group.operatingSystem;
+        }
         throw std::runtime_error("unknown OS '" + explicitOs + "'");
     }
 
@@ -92,11 +78,14 @@ OperatingSystem pickOperatingSystem(const std::string& explicitOs,
         if (triple.isOSDarwin()) return OperatingSystem::Darwin;
         if (triple.isOSWindows()) return OperatingSystem::Windows;
         if (triple.getOS() == llvm::Triple::WASI) return OperatingSystem::WASI;
-        if (triple.getOSName().empty() || triple.getOSName() == "unknown" || triple.getOSName() == "none")
+        if (triple.getOS() == llvm::Triple::UnknownOS
+            && (triple.getOSName().empty() || triple.getOSName() == "unknown"
+                || triple.getOSName() == "none"))
             return OperatingSystem::FreeStanding;
+        if (triple.getOS() != llvm::Triple::UnknownOS)
+            return OperatingSystem::TargetSpecific;
         throw std::runtime_error("unsupported OS in target triple '" + targetTriple + "'");
     }
 
     return OperatingSystem::Linux;
 }
-

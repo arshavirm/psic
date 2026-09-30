@@ -1,6 +1,8 @@
 #include "parser.hpp"
 #include <algorithm>
 #include <array>
+#include <charconv>
+#include <limits>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
@@ -8,6 +10,44 @@
 static bool isHexDigitChar(char c)
 {
     return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
+static long long parseSignedIntegerLiteral(const std::string& spelling)
+{
+    std::string_view digits(spelling);
+    const bool negative = !digits.empty() && digits.front() == '-';
+    if (negative) digits.remove_prefix(1);
+
+    unsigned base = 10;
+    if (digits.size() >= 2 && digits[0] == '0'
+        && (digits[1] == 'x' || digits[1] == 'X')) {
+        base = 16;
+        digits.remove_prefix(2);
+    } else if (digits.size() >= 2 && digits[0] == '0'
+        && (digits[1] == 'o' || digits[1] == 'O')) {
+        base = 8;
+        digits.remove_prefix(2);
+    }
+
+    const auto positiveLimit = static_cast<unsigned long long>(
+        std::numeric_limits<long long>::max());
+    const auto limit = negative ? positiveLimit + 1ull : positiveLimit;
+    unsigned long long magnitude = 0;
+    for (char character : digits) {
+        unsigned digit;
+        if (character >= '0' && character <= '9') digit = character - '0';
+        else if (character >= 'a' && character <= 'f') digit = character - 'a' + 10;
+        else if (character >= 'A' && character <= 'F') digit = character - 'A' + 10;
+        else throw std::out_of_range("invalid integer digit");
+        if (digit >= base || magnitude > (limit - digit) / base)
+            throw std::out_of_range("integer literal is out of range");
+        magnitude = magnitude * base + digit;
+    }
+
+    if (!negative) return static_cast<long long>(magnitude);
+    if (magnitude == positiveLimit + 1ull)
+        return std::numeric_limits<long long>::min();
+    return -static_cast<long long>(magnitude);
 }
 
 Parser::Parser(std::vector<Token> tokenList)
@@ -69,8 +109,9 @@ Token Parser::expectTokenType(TokenType type, const std::string& what)
 void Parser::raiseError(const std::string& message)
 {
     Token token = currentToken();
-    std::string fullMessage = "parse error at line " + std::to_string(token.line) + ", column " + std::to_string(token.column) + ": " + message + " (found '" + token.text + "')";
-    throw std::runtime_error(fullMessage);
+    std::string fullMessage = message + " (found '" + token.text + "')";
+    throw LocatedSourceError(fullMessage,
+        {static_cast<std::size_t>(token.line), static_cast<std::size_t>(token.column)});
 }
 
 bool Parser::isInstructionKeyword(const std::string& text)
@@ -107,23 +148,34 @@ int Parser::expectIndexNumber(const std::string& what)
     Token token = expectTokenType(TokenType::Number, what);
 
     bool isHex = token.text.size() > 2 && token.text[0] == '0' && (token.text[1] == 'x' || token.text[1] == 'X');
+    bool isOctal = token.text.size() > 2 && token.text[0] == '0' && (token.text[1] == 'o' || token.text[1] == 'O');
 
-    if (isHex) {
-        for (std::size_t i = 2; i < token.text.size(); i++) {
-            if (!isHexDigitChar(token.text[i])) {
+    try {
+        if (isHex) {
+            for (std::size_t i = 2; i < token.text.size(); i++) {
+                if (!isHexDigitChar(token.text[i])) {
+                    raiseError(what + " must be a plain whole number (no '-' or '.')");
+                }
+            }
+            return std::stoi(token.text, nullptr, 16);
+        }
+        if (isOctal) {
+            for (std::size_t i = 2; i < token.text.size(); ++i)
+                if (token.text[i] < '0' || token.text[i] > '7') raiseError(what + " must be an octal whole number");
+            return std::stoi(token.text.substr(2), nullptr, 8);
+        }
+
+        for (std::size_t i = 0; i < token.text.size(); i++) {
+            char c = token.text[i];
+            if (c < '0' || c > '9') {
                 raiseError(what + " must be a plain whole number (no '-' or '.')");
             }
         }
-        return std::stoi(token.text, nullptr, 16);
+        return std::stoi(token.text);
+    } catch (const std::out_of_range&) {
+        throw LocatedSourceError(what + " is too large",
+            {static_cast<std::size_t>(token.line), static_cast<std::size_t>(token.column)});
     }
-
-    for (std::size_t i = 0; i < token.text.size(); i++) {
-        char c = token.text[i];
-        if (c < '0' || c > '9') {
-            raiseError(what + " must be a plain whole number (no '-' or '.')");
-        }
-    }
-    return std::stoi(token.text);
 }
 
 TypeNode Parser::parseType()
@@ -136,6 +188,14 @@ TypeNode Parser::parseType()
     while (checkTokenType(TokenType::Star)) {
         consumeToken();
         type.pointerLevel = type.pointerLevel + 1;
+    }
+
+    if (checkTokenType(TokenType::LeftBracket) && checkTokenTypeAhead(TokenType::RightBracket, 1)) {
+        consumeToken();
+        consumeToken();
+        type.isView = true;
+        if (checkTokenType(TokenType::Star))
+            raiseError("a view type cannot have pointer levels outside the view; put '*' before '[]'");
     }
 
     if (checkTokenType(TokenType::Colon)) {
@@ -283,13 +343,30 @@ ValueNode* Parser::parseValue()
             && token.text[hexPrefixPos] == '0'
             && (token.text[hexPrefixPos + 1] == 'x' || token.text[hexPrefixPos + 1] == 'X');
 
-        bool hasDecimalPoint = !isHex && (token.text.find('.') != std::string::npos);
+        bool isOctal = token.text.size() > hexPrefixPos + 1
+            && token.text[hexPrefixPos] == '0'
+            && (token.text[hexPrefixPos + 1] == 'o' || token.text[hexPrefixPos + 1] == 'O');
+        bool hasDecimalPoint = !isHex && !isOctal && (token.text.find('.') != std::string::npos);
         if (hasDecimalPoint) {
             value->numberIsFloat = true;
-            value->numberAsFloat = std::stod(token.text);
+            double parsedValue = 0.0;
+            const char* begin = token.text.data();
+            const char* end = begin + token.text.size();
+            const auto parsed = std::from_chars(begin, end, parsedValue,
+                std::chars_format::fixed);
+            if (parsed.ec != std::errc{} || parsed.ptr != end) {
+                throw LocatedSourceError("floating-point literal is out of range",
+                    {static_cast<std::size_t>(token.line), static_cast<std::size_t>(token.column)});
+            }
+            value->numberAsFloat = parsedValue;
         } else {
             value->numberIsFloat = false;
-            value->numberAsInt = isHex ? std::stoll(token.text, nullptr, 16) : std::stoll(token.text);
+            try {
+                value->numberAsInt = parseSignedIntegerLiteral(token.text);
+            } catch (const std::exception&) {
+                throw LocatedSourceError("integer literal is out of range",
+                    {static_cast<std::size_t>(token.line), static_cast<std::size_t>(token.column)});
+            }
         }
         return value;
     }
@@ -298,7 +375,12 @@ ValueNode* Parser::parseValue()
         consumeToken();
         ValueNode* value = makeValue();
         value->kind = ValueKind::String;
-        value->stringValue = decodeStringEscapes(token.text);
+        try {
+            value->stringValue = decodeStringEscapes(token.text);
+        } catch (const LocatedSourceError& error) {
+            throw LocatedSourceError(error.what(),
+                {static_cast<std::size_t>(token.line), static_cast<std::size_t>(token.column)});
+        }
         return value;
     }
 
@@ -314,8 +396,12 @@ ValueNode* Parser::parseValue()
         consumeToken();
         ValueNode* value = makeValue();
         value->kind = ValueKind::Array;
-        while (!checkTokenType(TokenType::RightBracket)) {
+        if (!checkTokenType(TokenType::RightBracket)) {
             value->arrayValues.push_back(parseValue());
+            while (checkTokenType(TokenType::Comma)) {
+                consumeToken();
+                value->arrayValues.push_back(parseValue());
+            }
         }
         expectTokenType(TokenType::RightBracket, "']'");
         return value;
@@ -351,6 +437,8 @@ ValueNode* Parser::parseValue()
 CommandNode Parser::parseCommand()
 {
     CommandNode command;
+    command.location = {static_cast<std::size_t>(currentToken().line),
+        static_cast<std::size_t>(currentToken().column)};
 
     if (checkTokenType(TokenType::Semicolon)) {
         consumeToken();
@@ -365,7 +453,9 @@ CommandNode Parser::parseCommand()
         command.targetSpecialRegister.name = token.text.substr(1);
     } else if (!startsInstruction && checkTokenType(TokenType::Identifier)) {
         const bool startsDeclaration = checkTokenTypeAhead(TokenType::Identifier, 1)
-            || checkTokenTypeAhead(TokenType::Star, 1) || checkTokenTypeAhead(TokenType::Colon, 1);
+            || checkTokenTypeAhead(TokenType::Star, 1) || checkTokenTypeAhead(TokenType::Colon, 1)
+            || (checkTokenTypeAhead(TokenType::LeftBracket, 1)
+                && checkTokenTypeAhead(TokenType::RightBracket, 2));
         const bool startsAssignment = checkTokenTypeAhead(TokenType::Equals, 1)
             || checkTokenTypeAhead(TokenType::LeftBracket, 1) || checkTokenTypeAhead(TokenType::Dot, 1);
 
@@ -437,6 +527,12 @@ StructDeclNode Parser::parseStructDeclaration()
     expectTokenType(TokenType::LeftBrace, "'{'");
     while (!checkTokenType(TokenType::RightBrace)) {
         decl.fields.push_back(parseArgument());
+        if (!checkTokenType(TokenType::RightBrace) && checkTokenType(TokenType::Semicolon))
+            consumeToken();
+        else if (!checkTokenType(TokenType::RightBrace)
+            && !(checkTokenType(TokenType::Identifier)
+                || checkTokenType(TokenType::SpecialRegister)))
+            raiseError("expected ';' between struct members");
     }
     expectTokenType(TokenType::RightBrace, "'}'");
     return decl;
@@ -490,6 +586,10 @@ ConstDeclNode Parser::parseConstDeclaration()
 DeclarationNode Parser::parseDeclaration()
 {
     DeclarationNode decl;
+    const Token declarationToken = currentToken();
+    decl.location = {
+        static_cast<std::size_t>(declarationToken.line),
+        static_cast<std::size_t>(declarationToken.column)};
 
     if (checkKeyword("entry")) {
         consumeToken();

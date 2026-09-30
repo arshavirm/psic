@@ -2,6 +2,7 @@
 
 #include <string>
 #include <memory>
+#include <stdexcept>
 #include <vector>
 
 struct TypeNode {
@@ -10,6 +11,20 @@ struct TypeNode {
     bool hasAlignment = false;
     int alignment = 0;
     bool isPrimitive = false;
+    bool isView = false;
+};
+
+struct SourceLocation {
+    std::size_t line = 0;
+    std::size_t column = 0;
+};
+
+class LocatedSourceError : public std::runtime_error {
+public:
+    LocatedSourceError(const std::string& message, SourceLocation sourceLocation)
+        : std::runtime_error(message), location(sourceLocation) {}
+
+    SourceLocation location;
 };
 
 enum class AccessorKind {
@@ -77,6 +92,7 @@ enum class TargetKind {
 };
 
 struct CommandNode {
+    SourceLocation location;
     bool isEmpty = false;
 
     bool hasDeclaredType = false;
@@ -135,6 +151,7 @@ enum class DeclKind {
 };
 
 struct DeclarationNode {
+    SourceLocation location;
     DeclKind kind = DeclKind::Glob;
     EntryDeclNode entryDecl;
     StructDeclNode structDecl;

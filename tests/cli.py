@@ -23,7 +23,21 @@ def contains(text, expected):
 
 
 contains(run(['--help']).stdout, 'wasm32')
+contains(run(['--help']).stdout, '-O0')
+contains(run(['--help']).stdout, '-O3')
 contains(run(['--version']).stdout, 'psic 0.1.0')
+run(['--jit', '--entry', 'finish', '-'], 'func i32 finish { ret 7; }', expected=7)
+contains(run(['-c', '--emit-llvm', 'missing.psi'], expected=2).stderr, 'choose one')
+contains(run(['--jit', '-o', 'ignored.o', '-'], '', expected=2).stderr,
+    'cannot be combined with output options')
+contains(run(['--entry', 'finish', '-'], '', expected=2).stderr, 'requires --jit')
+contains(run(['--jit', '--entry', 'first', '--entry', 'second', '-'], '', expected=2).stderr,
+    "conflicting values supplied for '--entry'")
+contains(run(['--target', 'x86_64-unknown-linux-gnu', '--target', 'aarch64-unknown-linux-gnu', '-'], '', expected=2).stderr,
+    "conflicting values supplied for '--target'")
+contains(run(['-o', 'first.o', '--output', 'second.o', '-'], '', expected=2).stderr,
+    "conflicting values supplied for '-o/--output'")
+run(['--arch', 'x86_64', '--arch', 'x86_64', '--emit-llvm', '-o', '-', '-'], '')
 contains(run([], expected=2).stderr, 'no input files')
 contains(run(['--bad-option'], expected=2).stderr, 'unknown option')
 for option in ['-o', '--arch', '--os', '--target']:
@@ -55,5 +69,22 @@ with tempfile.TemporaryDirectory(prefix='psic cli ') as folder:
         raise AssertionError('failed compilation overwrote an existing output')
     run(['--emit-llvm', '-', '-o', str(root / 'absent' / 'file.ll')], '', expected=1)
     run(['-', '-o', '-'], '', expected=1)
-    contains(run(['--emit-llvm', '-', '-o', '-'], 'entry main {\n i32 x = "oops;\n}', expected=1).stderr, 'line 2')
+    parse_error = run(['--emit-llvm', '-', '-o', '-'],
+        'entry main {\n i32 x = "oops;\n}', expected=1)
+    contains(parse_error.stderr, '<stdin>:2:')
+    contains(parse_error.stderr, 'i32 x = "oops;')
+    located = run(['--emit-llvm', '-', '-o', '-'],
+        'entry main {\n  i32 value = add 1;\n}', expected=1)
+    contains(located.stderr, '<stdin>:2:3:')
+    contains(located.stderr, '  i32 value = add 1;')
+    contains(located.stderr, '  ^')
+    tabbed = run(['--emit-llvm', '-', '-o', '-'],
+        'entry main {\n\t i32 value = add 1;\n}', expected=1)
+    contains(tabbed.stderr, '<stdin>:2:3:')
+    if '         ^' not in tabbed.stderr:
+        raise AssertionError(f'caret did not account for tab expansion: {tabbed.stderr!r}')
+    backend_located = run(['--emit-llvm', '-', '-o', '-'],
+        'entry main {\n  #unknown_operation;\n}', expected=1)
+    contains(backend_located.stderr, '<stdin>:2:3:')
+    contains(backend_located.stderr, '#unknown_operation;')
 print(f'Passed {count} CLI contract checks.')

@@ -1,7 +1,9 @@
 #pragma once
 
 #include <string>
+#include <string_view>
 #include <vector>
+#include "ast.hpp"
 
 enum class TokenType {
     Identifier,
@@ -18,6 +20,7 @@ enum class TokenType {
     Colon,
     Equals,
     Semicolon,
+    Comma,
     EndOfFile,
 };
 
@@ -30,15 +33,17 @@ struct Token {
 
 class Lexer {
 public:
-    Lexer(const std::string& sourceCode);
+    explicit Lexer(std::string_view sourceCode);
 
     std::vector<Token> tokenize();
 
 private:
-    std::string source;
+    std::string_view source;
     std::size_t position = 0;
     int line = 1;
     int column = 1;
+    std::size_t utf8ContinuationBytes = 0;
+    bool previousWasCarriageReturn = false;
 
     bool isAtEnd();
     char currentChar();

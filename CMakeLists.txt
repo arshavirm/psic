@@ -15,7 +15,7 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 add_library(psic_lib
-    src/compiler.cpp src/target.cpp src/codegen.cpp src/codegen_module.cpp
+    src/compiler.cpp src/c_api.cpp src/target.cpp src/codegen.cpp src/codegen_module.cpp
     src/codegen_instructions.cpp src/codegen_registers.cpp src/validation.cpp
     src/lexer.cpp src/parser.cpp src/logging.cpp)
 add_library(PSIC::psic ALIAS psic_lib)
@@ -43,7 +43,7 @@ if(TARGET LLVM)
     target_link_libraries(psic_lib PRIVATE LLVM)
 else()
     llvm_map_components_to_libnames(llvm_libs
-        core irreader passes support target targetparser
+        core irreader passes support target targetparser executionengine mcjit runtimedyld native
         AllTargetsCodeGens AllTargetsAsmParsers AllTargetsDescs AllTargetsInfos)
     target_link_libraries(psic_lib PRIVATE ${llvm_libs})
 endif()
@@ -64,6 +64,7 @@ endif()
 if(PSIC_BUILD_CLI)
     add_executable(psic src/main.cpp)
     target_link_libraries(psic PRIVATE PSIC::psic)
+    target_compile_definitions(psic PRIVATE PSIC_VERSION="${PROJECT_VERSION}")
     # CLI logging is private; do not export internal library functions for it.
     target_sources(psic PRIVATE src/logging.cpp)
     if(BUILD_SHARED_LIBS AND UNIX)
@@ -111,6 +112,10 @@ if(BUILD_TESTING AND PSIC_BUILD_TESTS)
     add_executable(psic_library_tests tests/library.cpp)
     target_link_libraries(psic_library_tests PRIVATE PSIC::psic Threads::Threads)
     add_test(NAME library COMMAND psic_library_tests)
+    add_executable(psic_c_api_tests tests/c_api.c)
+    set_target_properties(psic_c_api_tests PROPERTIES LINKER_LANGUAGE CXX)
+    target_link_libraries(psic_c_api_tests PRIVATE PSIC::psic)
+    add_test(NAME c_api COMMAND psic_c_api_tests)
     if(PSIC_BUILD_CLI)
         add_test(NAME architectures
             COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/architectures.py $<TARGET_FILE:psic>)
