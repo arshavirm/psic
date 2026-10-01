@@ -109,9 +109,13 @@ int main(void)
         return 11;
 
     options.struct_size = (uint32_t)sizeof(options);
-    if (psic_compile_source(valid_source, strlen(valid_source), &options) == 0
-        || psic_last_error_message() != 0)
+    result = psic_compile_source(valid_source, strlen(valid_source), &options);
+    if (!result || !psic_compile_result_success(result)
+        || psic_last_error_message() != 0) {
+        psic_compile_result_destroy(result);
         return 12;
+    }
+    psic_compile_result_destroy(result);
     if (psic_compile_source(0, 1, &options) != 0)
         return 13;
     api_error = psic_last_error_message();

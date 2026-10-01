@@ -73,3 +73,6 @@ Testing/
 # Keep compiler regression fixtures in version control
 !tests/**/*.psi
 !tests/*.psi
+
+# LLVM IR files
+*.ll

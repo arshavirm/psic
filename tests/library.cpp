@@ -165,7 +165,11 @@ int main()
                     != std::string::npos,
             "JIT accepted an entry with arguments");
         psic::JitOptions crossTargetJit;
+#if defined(__aarch64__) || defined(_M_ARM64)
+        crossTargetJit.compile.targetTriple = "x86_64-unknown-linux-gnu";
+#else
         crossTargetJit.compile.targetTriple = "aarch64-unknown-linux-gnu";
+#endif
         auto rejectedCrossTarget = psic::execute("entry main { ret; }", crossTargetJit);
         check(!rejectedCrossTarget.success && !rejectedCrossTarget.diagnostics.empty()
                 && rejectedCrossTarget.diagnostics.front().message.find("native target triple")

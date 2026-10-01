@@ -26,7 +26,8 @@ def require(condition, message):
         raise AssertionError(message)
 
 
-def compile_source(arch, body, *, options=(), error=None, ir=False, raw=False, infer=False):
+def compile_source(arch, body, *, options=(), error=None, ir=False, raw=False, infer=False,
+                  object_format=None, machine=None):
     global COUNT
     COUNT += 1
     source = body if raw else 'entry main { ' + body + ' ret; }'
@@ -48,7 +49,14 @@ def compile_source(arch, body, *, options=(), error=None, ir=False, raw=False, i
             text = data.decode()
             require('target datalayout = ' in text, context)
             return text
-        if TARGETS[arch] is None:
+        if object_format == 'coff':
+            require(int.from_bytes(data[:2], 'little') == machine, context)
+        elif object_format == 'macho':
+            require(data[:4] in (b'\xce\xfa\xed\xfe', b'\xcf\xfa\xed\xfe'), context)
+            require(int.from_bytes(data[4:8], 'little') == machine, context)
+        elif object_format == 'wasm':
+            require(data[:8] == b'\x00asm\x01\x00\x00\x00', context)
+        elif TARGETS[arch] is None:
             require(data[:8] == b'\x00asm\x01\x00\x00\x00', context)
         else:
             machine, endian = TARGETS[arch]
@@ -175,6 +183,38 @@ for arch, triple in [('wasm32', 'wasm32-unknown-wasi'), ('riscv64', 'riscv64-unk
                      ('x86_64', 'x86_64-pc-linux-gnu')]:
     ir = compile_source(arch, '', options=['-target', triple], ir=True)
     require(f'target triple = "{triple}"' in ir, 'architecture expectation failed: f\'target triple = "{triple}"\' in ir')
+
+# Compile representative operating-system profiles independently of the host
+# runner. This checks LLVM target setup and PSI's architecture/OS mapping for
+# each supported platform family, including Windows ARM targets.
+TARGET_PROFILES = [
+    ('x86', 'i386-unknown-linux-gnu', 'elf', 3),
+    ('x86_64', 'x86_64-unknown-linux-gnu', 'elf', 62),
+    ('arm', 'armv7-unknown-linux-gnueabihf', 'elf', 40),
+    ('aarch64', 'aarch64-unknown-linux-gnu', 'elf', 183),
+    ('x86', 'i386-apple-macosx', 'macho', 7),
+    ('x86_64', 'x86_64-apple-macosx', 'macho', 0x01000007),
+    ('arm', 'armv7-apple-ios', 'macho', 12),
+    ('aarch64', 'arm64-apple-macosx', 'macho', 0x0100000C),
+    ('x86', 'i686-pc-windows-msvc', 'coff', 0x014C),
+    ('x86_64', 'x86_64-pc-windows-msvc', 'coff', 0x8664),
+    ('arm', 'thumbv7-pc-windows-msvc', 'coff', 0x01C4),
+    ('aarch64', 'aarch64-pc-windows-msvc', 'coff', 0xAA64),
+    ('x86', 'i386-unknown-none', 'elf', 3),
+    ('x86_64', 'x86_64-unknown-none', 'elf', 62),
+    ('arm', 'armv7-unknown-none-eabihf', 'elf', 40),
+    ('aarch64', 'aarch64-unknown-none', 'elf', 183),
+    ('wasm32', 'wasm32-unknown-unknown', 'wasm', None),
+    ('wasm32', 'wasm32-unknown-wasi', 'wasm', None),
+    ('wasm64', 'wasm64-unknown-unknown', 'wasm', None),
+    ('wasm64', 'wasm64-unknown-wasi', 'wasm', None),
+]
+for arch, triple, object_format, machine in TARGET_PROFILES:
+    ir = compile_source(arch, '', options=['--target', triple], ir=True, infer=True)
+    require(f'target triple = "{triple}"' in ir,
+            f'{arch} target profile did not emit the requested triple {triple}: {ir}')
+    compile_source(arch, '', options=['--target', triple], infer=True,
+                   object_format=object_format, machine=machine)
 
 # Exercise inference without --arch, rather than merely checking conflicts.
 import re

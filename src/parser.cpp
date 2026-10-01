@@ -1,8 +1,9 @@
 #include "parser.hpp"
 #include <algorithm>
 #include <array>
-#include <charconv>
 #include <limits>
+#include <locale>
+#include <sstream>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
@@ -350,11 +351,13 @@ ValueNode* Parser::parseValue()
         if (hasDecimalPoint) {
             value->numberIsFloat = true;
             double parsedValue = 0.0;
-            const char* begin = token.text.data();
-            const char* end = begin + token.text.size();
-            const auto parsed = std::from_chars(begin, end, parsedValue,
-                std::chars_format::fixed);
-            if (parsed.ec != std::errc{} || parsed.ptr != end) {
+            // Floating-point from_chars is missing from some C++17 standard
+            // libraries still used by supported platforms. Parse in the
+            // classic locale so decimal syntax is independent of host locale.
+            std::istringstream parser(token.text);
+            parser.imbue(std::locale::classic());
+            parser >> std::noskipws >> parsedValue;
+            if (parser.fail() || parser.peek() != std::char_traits<char>::eof()) {
                 throw LocatedSourceError("floating-point literal is out of range",
                     {static_cast<std::size_t>(token.line), static_cast<std::size_t>(token.column)});
             }
