@@ -104,6 +104,12 @@ llvm::Value* processValue(State& s, const ValueNode& value, llvm::IRBuilder<>* b
     case ValueKind::String:
         return builder->CreateGlobalStringPtr(value.stringValue);
     case ValueKind::Register: {
+        if (value.registerValue.accessors.empty()
+            && s.locals.find(value.registerValue.name) == s.locals.end()
+            && s.globals.find(value.registerValue.name) == s.globals.end()) {
+            auto function = s.functionDeclarations.find(value.registerValue.name);
+            if (function != s.functionDeclarations.end()) return function->second;
+        }
         RegisterAddress access = resolveRegisterAddress(s, value.registerValue, builder);
         if (!access.address) {
             return nullptr;
@@ -252,6 +258,8 @@ llvm::Value* processCallInstruction(State& s, const CommandNode& command, llvm::
 
     const std::string& calleeName = command.values[0]->registerValue.name;
     auto fnIt = s.functionDeclarations.find(calleeName);
+    if (s.locals.find(calleeName) != s.locals.end() || s.globals.find(calleeName) != s.globals.end())
+        fnIt = s.functionDeclarations.end();
     if (fnIt == s.functionDeclarations.end()) {
         llvm::Value* calleeValue = processValue(s, *command.values[0], builder);
         if (!calleeValue || !calleeValue->getType()->isPointerTy()) {
@@ -962,6 +970,24 @@ NativeInstructionResult processNativeInstruction(State& s, const std::string& na
 
     std::string assembly;
     bool memoryBarrier = false;
+    if (x86 && name == "int") {
+        if (command.values.size() != 1 || command.values[0]->kind != ValueKind::Number
+            || command.values[0]->numberIsFloat || command.values[0]->numberAsInt < 0
+            || command.values[0]->numberAsInt > 255) {
+            psi::ErrorStream() << "'#int' requires an integer literal from 0 to 255\n";
+            return NativeInstructionResult::Handled;
+        }
+        auto* signature = llvm::FunctionType::get(builder->getVoidTy(), false);
+        auto* interrupt = llvm::InlineAsm::get(signature,
+            "int $$" + std::to_string(command.values[0]->numberAsInt),
+            "~{memory},~{dirflag},~{fpsr},~{flags}", true);
+        builder->CreateCall(interrupt);
+        return NativeInstructionResult::Handled;
+    }
+    if (x86 && name == "ud2") {
+        assembly = "ud2";
+        memoryBarrier = true;
+    }
     if (name == "nop") {
         if (isWasm(s) || s.architecture == Architecture::LLVMGeneric) {
             if (!command.values.empty()) psi::ErrorStream() << "'#nop' takes no operands\n";

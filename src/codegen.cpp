@@ -357,16 +357,30 @@ bool compileToObjectMemory(
     return true;
 }
 
+class NativeJitModule final : public psic::JitModule {
+public:
+    std::unique_ptr<llvm::LLVMContext> context;
+    std::unique_ptr<llvm::ExecutionEngine> engine;
+    std::unordered_map<std::string, std::uintptr_t> functions;
+
+    std::uintptr_t functionAddress(const std::string& name) const noexcept override
+    {
+        auto found = functions.find(name);
+        return found == functions.end() ? 0 : found->second;
+    }
+};
+
 bool executeJit(const std::string& irCode, const std::string& entry,
     const std::vector<psic::JitOptions::FunctionSymbol>& externalFunctions,
     std::int32_t& exitCode, std::string& errorMessage,
-    const std::string& targetCPU, const std::string& targetFeatures)
+    const std::string& targetCPU, const std::string& targetFeatures,
+    std::shared_ptr<psic::JitModule>* preparedModule)
 {
     static std::mutex jitMutex;
-    std::lock_guard<std::mutex> lock(jitMutex);
+    std::unique_lock<std::mutex> lock(jitMutex);
     initializeAllTargetComponents();
-    llvm::LLVMContext context;
-    auto module = parseIRModule(irCode, context, errorMessage);
+    auto ownedContext = std::make_unique<llvm::LLVMContext>();
+    auto module = parseIRModule(irCode, *ownedContext, errorMessage);
     if (!module) return false;
     const std::string triple = llvm::sys::getDefaultTargetTriple();
     const llvm::Triple requested(module->getTargetTriple());
@@ -392,12 +406,12 @@ bool executeJit(const std::string& irCode, const std::string& entry,
     }
     module->setTargetTriple(triple);
     auto* function = module->getFunction(entry);
-    if (!function || function->empty()) {
+    if (!preparedModule && (!function || function->empty())) {
         errorMessage = "JIT entry '" + entry + "' is not a defined function";
         return false;
     }
-    if (function->arg_size() != 0 || (!function->getReturnType()->isVoidTy()
-        && !function->getReturnType()->isIntegerTy(32))) {
+    if (!preparedModule && (function->arg_size() != 0 || (!function->getReturnType()->isVoidTy()
+        && !function->getReturnType()->isIntegerTy(32)))) {
         errorMessage = "JIT entry must take no arguments and return void or i32";
         return false;
     }
@@ -429,6 +443,9 @@ bool executeJit(const std::string& irCode, const std::string& entry,
             return false;
         }
     }
+    std::vector<std::string> definedFunctions;
+    for (const llvm::Function& candidate : *module)
+        if (!candidate.isDeclaration()) definedFunctions.push_back(candidate.getName().str());
     llvm::EngineBuilder builder(std::move(module));
     builder.setEngineKind(llvm::EngineKind::JIT);
     builder.setMCPU(targetCPU.empty() ? "generic" : targetCPU);
@@ -450,10 +467,31 @@ bool executeJit(const std::string& irCode, const std::string& entry,
     for (std::size_t index = 0; index < externalFunctions.size(); ++index) {
         engine->addGlobalMapping(mappedDeclarations[index], externalFunctions[index].address);
     }
-    auto* jitFunction = engine->FindFunctionNamed(entry.c_str());
-    if (!jitFunction) { errorMessage = "JIT could not resolve entry '" + entry + "'"; return false; }
-    auto value = engine->runFunction(jitFunction, {});
-    exitCode = function->getReturnType()->isVoidTy() ? 0 : value.IntVal.getSExtValue();
+    auto prepared = std::make_shared<NativeJitModule>();
+    prepared->context = std::move(ownedContext);
+    prepared->engine = std::move(engine);
+    for (const auto& name : definedFunctions) {
+        const auto address = prepared->engine->getFunctionAddress(name);
+        if (!address || prepared->engine->hasError()) {
+            errorMessage = "JIT could not resolve function '" + name + "': "
+                + prepared->engine->getErrorMessage();
+            return false;
+        }
+        prepared->functions.emplace(name, static_cast<std::uintptr_t>(address));
+    }
+    if (preparedModule) {
+        *preparedModule = std::move(prepared);
+        return true;
+    }
+    const auto address = prepared->functionAddress(entry);
+    const bool returnsVoid = function->getReturnType()->isVoidTy();
+    lock.unlock();
+    if (returnsVoid) {
+        reinterpret_cast<void (*)()>(address)();
+        exitCode = 0;
+    } else {
+        exitCode = reinterpret_cast<std::int32_t (*)()>(address)();
+    }
     return true;
 }
 

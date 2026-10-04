@@ -127,12 +127,29 @@ struct JitOptions {
     // functions and must keep them valid for execute().
     std::vector<FunctionSymbol> externalFunctions;
 };
+class PSIC_EXPORT JitModule {
+public:
+    virtual ~JitModule() = default;
+    // Zero means the function was not defined. Cast addresses to the exact
+    // native signature declared in PSI. Keep the module and host mappings
+    // alive throughout every call. Lookup is safe concurrently; execution of
+    // functions sharing mutable globals requires caller synchronization.
+    virtual std::uintptr_t functionAddress(const std::string& name) const noexcept = 0;
+};
+
 struct JitResult {
     bool success = false;
     std::int32_t exitCode = 0;
     std::string targetTriple;
     std::vector<Diagnostic> diagnostics;
 };
+struct JitModuleResult : JitResult {
+    std::shared_ptr<JitModule> module;
+};
+// Compile once without invoking an entry. options.entry is ignored. Function
+// addresses remain valid while module is owned; host mappings must also remain
+// alive. Source views only need to remain valid for this call.
+PSIC_EXPORT JitModuleResult prepareJit(std::string_view source, const JitOptions& options = {});
 // Compile and execute a native PSI entry point in-process. Cross-target JIT
 // is rejected. The entry must take no arguments and return void or i32.
 // Source, target, and JIT setup failures are returned as diagnostics;

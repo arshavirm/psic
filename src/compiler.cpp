@@ -231,9 +231,9 @@ CompileResult ModuleBuilder::compile(const CompileOptions& options) const
     return psic::compile(source_, configured);
 }
 
-JitResult execute(std::string_view source, const JitOptions& options)
+static JitModuleResult buildJit(std::string_view source, const JitOptions& options, bool prepare)
 {
-    JitResult result;
+    JitModuleResult result;
     if (options.compile.output != OutputKind::LLVMIR) {
         result.diagnostics.push_back({DiagnosticSeverity::Error,
             "JIT execution cannot request object-file output", 0, 0,
@@ -273,7 +273,7 @@ JitResult execute(std::string_view source, const JitOptions& options)
     std::string error;
     try {
         SourceLocation errorLocation;
-        if (!validateJitEntrySignature(source, options.entry, error, errorLocation)) {
+        if (!prepare && !validateJitEntrySignature(source, options.entry, error, errorLocation)) {
             result.diagnostics.push_back({DiagnosticSeverity::Error, std::move(error),
                 errorLocation.line, errorLocation.column,
                 options.compile.sourceName, {}, false});
@@ -293,7 +293,7 @@ JitResult execute(std::string_view source, const JitOptions& options)
     try {
         if (!psi_codegen::executeJit(compiled.ir, options.entry, options.externalFunctions,
                 result.exitCode, error, options.compile.targetCPU,
-                options.compile.targetFeatures)) {
+                options.compile.targetFeatures, prepare ? &result.module : nullptr)) {
             result.diagnostics.push_back({DiagnosticSeverity::Error, std::move(error), 0, 0,
                 options.compile.sourceName, {}, false});
             return result;
@@ -313,6 +313,16 @@ JitResult execute(std::string_view source, const JitOptions& options)
     }
     result.success = true;
     return result;
+}
+
+JitModuleResult prepareJit(std::string_view source, const JitOptions& options)
+{
+    return buildJit(source, options, true);
+}
+
+JitResult execute(std::string_view source, const JitOptions& options)
+{
+    return buildJit(source, options, false);
 }
 
 JitResult execute(const std::string& source, const JitOptions& options)

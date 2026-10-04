@@ -30,6 +30,7 @@ struct psic_compile_result {
 
 struct psic_jit_result {
     psic::JitResult value;
+    std::shared_ptr<psic::JitModule> module;
 };
 
 namespace {
@@ -285,6 +286,44 @@ psic_jit_result *psic_execute_source(const char *source, size_t source_length,
 void psic_jit_result_destroy(psic_jit_result *result)
 {
     delete result;
+}
+
+psic_jit_result *psic_prepare_jit_source(const char *source, size_t source_length,
+    const psic_jit_options *options)
+{
+    clearLastErrorMessage();
+    if ((!source && source_length != 0) || source_length > std::string().max_size()) {
+        setLastErrorMessage("invalid source pointer or source length");
+        return nullptr;
+    }
+    try {
+        auto result = std::make_unique<psic_jit_result>();
+        auto prepared = psic::prepareJit(std::string_view(source ? source : "", source_length),
+            convertJitOptions(options));
+        result->module = std::move(prepared.module);
+        result->value = std::move(prepared);
+        return result.release();
+    } catch (const std::exception& error) {
+        setLastErrorMessage(error.what());
+        return nullptr;
+    } catch (...) {
+        setLastErrorMessage("unknown JIT API failure");
+        return nullptr;
+    }
+}
+
+uintptr_t psic_jit_result_function_address(const psic_jit_result *result, const char *name)
+{
+    if (!result || !result->value.success || !result->module || !name) return 0;
+    try {
+        return result->module->functionAddress(name);
+    } catch (const std::exception& error) {
+        setLastErrorMessage(error.what());
+        return 0;
+    } catch (...) {
+        setLastErrorMessage("unknown JIT lookup failure");
+        return 0;
+    }
 }
 
 int psic_jit_result_success(const psic_jit_result *result)

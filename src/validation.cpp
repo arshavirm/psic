@@ -352,7 +352,13 @@ ValueType inferValueType(const ValueNode& value,
     case ValueKind::Bool: return {{"bool", 0}, false, true};
     case ValueKind::String: return {{"i8", 1}, false, true};
     case ValueKind::Null: return {{}, true, true};
-    case ValueKind::Register: return {registerType(value.registerValue, locals, env), false, true};
+    case ValueKind::Register:
+        if (value.registerValue.accessors.empty()
+            && locals.find(value.registerValue.name) == locals.end()
+            && env.globals.find(value.registerValue.name) == env.globals.end()
+            && env.parameters.find(value.registerValue.name) != env.parameters.end())
+            return {{"void", 1}, false, true};
+        return {registerType(value.registerValue, locals, env), false, true};
     case ValueKind::Array:
     case ValueKind::SpecialRegister: return {};
     }
@@ -424,8 +430,14 @@ ValueType inferCommandType(const CommandNode& command,
     if (op == "call" && !command.values.empty()
         && command.values[0]->kind == ValueKind::Register) {
         auto result = env.returns.find(command.values[0]->registerValue.name);
+        if (locals.find(command.values[0]->registerValue.name) != locals.end()
+            || env.globals.find(command.values[0]->registerValue.name) != env.globals.end())
+            result = env.returns.end();
         if (result != env.returns.end()) return {result->second, false, true};
         if (command.hasDeclaredType) return {command.declaredType, false, true};
+        if (command.targetKind == TargetKind::Register)
+            return {registerType(command.targetRegister, locals, env), false, true};
+        return {{"void", 0}, false, true};
     }
     if (!command.values.empty()) return inferValueType(*command.values[0], locals, env);
     if (command.hasDeclaredType) return {command.declaredType, false, true};
@@ -988,6 +1000,26 @@ void validateBlock(const BlockNode& block, const TypeEnvironment& env,
             const std::string& op = command.instruction.name;
             if (command.instruction.isSpecial) {
                 const std::string special = normalizedInstructionName(op);
+                if (special == "int") {
+                    require(pointerModel.architecture == Architecture::X86
+                            || pointerModel.architecture == Architecture::X86_64,
+                        "'#int' requires an x86 target");
+                    require(command.values.size() == 1, "'#int' requires one interrupt vector");
+                    const ValueNode& vector = *command.values[0];
+                    require(vector.kind == ValueKind::Number && !vector.numberIsFloat
+                            && vector.numberAsInt >= 0 && vector.numberAsInt <= 255,
+                        "'#int' vector must be an integer literal from 0 to 255");
+                    require(command.targetKind == TargetKind::None,
+                        "'#int' does not produce a result");
+                }
+                if (special == "ud2") {
+                    require(pointerModel.architecture == Architecture::X86
+                            || pointerModel.architecture == Architecture::X86_64,
+                        "'#ud2' requires an x86 target");
+                    require(command.values.empty(), "'#ud2' takes no operands");
+                    require(command.targetKind == TargetKind::None,
+                        "'#ud2' does not produce a result");
+                }
                 constexpr std::array<std::string_view, 25> nativeSpecials = {
                     "pause", "lfence", "sfence", "mfence", "hlt", "cli", "sti",
                     "yield", "dmb", "dsb", "isb", "wfi", "wfe", "sev", "sevl",
@@ -1314,6 +1346,8 @@ void validateBlock(const BlockNode& block, const TypeEnvironment& env,
                 && command.values[0]->kind == ValueKind::Register) {
                 const std::string& callee = command.values[0]->registerValue.name;
                 auto parameters = env.parameters.find(callee);
+                if (locals.find(callee) != locals.end() || env.globals.find(callee) != env.globals.end())
+                    parameters = env.parameters.end();
                 if (parameters == env.parameters.end()) {
                     TypeNode functionPointer = registerType(command.values[0]->registerValue, locals, env);
                     require(functionPointer.pointerLevel > 0,

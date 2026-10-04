@@ -53,6 +53,7 @@ bool compileToObjectMemory(
 bool executeJit(const std::string& irCode, const std::string& entry,
     const std::vector<psic::JitOptions::FunctionSymbol>& externalFunctions,
     std::int32_t& exitCode, std::string& errorMessage,
-    const std::string& targetCPU = "", const std::string& targetFeatures = "");
+    const std::string& targetCPU = "", const std::string& targetFeatures = "",
+    std::shared_ptr<psic::JitModule>* preparedModule = nullptr);
 
 } // namespace psi_codegen

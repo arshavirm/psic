@@ -126,6 +126,14 @@ PSIC_EXPORT const char *psic_compile_result_diagnostic_source_line(
  * result with success() == 0. No exception crosses this C ABI. */
 PSIC_EXPORT psic_jit_result *psic_execute_source(
     const char *source, size_t source_length, const psic_jit_options *options);
+/* Compile a reusable native module without invoking an entry. The entry option
+ * is ignored. Addresses remain valid until this result is destroyed; callers
+ * must use the exact native signature declared in PSI. Missing names return 0.
+ * Host mappings must remain valid for the entire lifetime of the module. */
+PSIC_EXPORT psic_jit_result *psic_prepare_jit_source(
+    const char *source, size_t source_length, const psic_jit_options *options);
+PSIC_EXPORT uintptr_t psic_jit_result_function_address(
+    const psic_jit_result *result, const char *name);
 PSIC_EXPORT void psic_jit_result_destroy(psic_jit_result *result);
 PSIC_EXPORT int psic_jit_result_success(const psic_jit_result *result);
 PSIC_EXPORT int32_t psic_jit_result_exit_code(const psic_jit_result *result);

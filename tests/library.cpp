@@ -180,8 +180,10 @@ int main()
         unsupportedJitFeature.compile.targetFeatures = "+psic_feature_not_present_on_any_host";
         auto rejectedJitFeature = psic::execute("entry main { ret; }", unsupportedJitFeature);
         check(!rejectedJitFeature.success && !rejectedJitFeature.diagnostics.empty()
-                && rejectedJitFeature.diagnostics.front().message.find("not supported by the host")
-                    != std::string::npos,
+                && (rejectedJitFeature.diagnostics.front().message.find("not supported by the host")
+                        != std::string::npos
+                    || rejectedJitFeature.diagnostics.front().message.find(
+                        "cannot verify requested CPU features against the host") != std::string::npos),
             "JIT accepted an instruction feature unavailable on the host: "
                 + diagnostics(rejectedJitFeature));
         auto guardedCoreOps = psic::compile(

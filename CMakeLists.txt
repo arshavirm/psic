@@ -23,6 +23,7 @@ set_target_properties(psic_lib PROPERTIES
     OUTPUT_NAME psic EXPORT_NAME psic POSITION_INDEPENDENT_CODE ON
     CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN YES
     VERSION ${PROJECT_VERSION} SOVERSION ${PROJECT_VERSION_MAJOR})
+set_target_properties(psic_lib PROPERTIES COMPILE_PDB_NAME psic_lib)
 target_compile_features(psic_lib PUBLIC cxx_std_17)
 
 include(GenerateExportHeader)
