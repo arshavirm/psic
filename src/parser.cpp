@@ -92,7 +92,8 @@ bool Parser::checkKeyword(const std::string& text) const
 
 bool Parser::isReservedWord(const std::string& text)
 {
-    return text == "true" || text == "false" || text == "null" || text == "nullptr";
+    return text == "true" || text == "false" || text == "null" || text == "nullptr"
+        || text == "const" || text == "volatile";
 }
 
 Token Parser::expectTokenType(TokenType type, const std::string& what)
@@ -182,6 +183,16 @@ int Parser::expectIndexNumber(const std::string& what)
 TypeNode Parser::parseType()
 {
     TypeNode type;
+    while (checkKeyword("const") || checkKeyword("volatile")) {
+        if (checkKeyword("const")) {
+            if (type.isConst) raiseError("duplicate const qualifier");
+            type.isConst = true;
+        } else {
+            if (type.isVolatile) raiseError("duplicate volatile qualifier");
+            type.isVolatile = true;
+        }
+        consumeToken();
+    }
 
     Token baseToken = expectTokenType(TokenType::Identifier, "a type name");
     type.baseName = baseToken.text;
@@ -449,6 +460,10 @@ CommandNode Parser::parseCommand()
         return command;
     }
 
+    if (checkKeyword("volatile") && tokenStartsInstruction(lookAheadToken(1))) {
+        consumeToken();
+        command.volatileAccess = true;
+    }
     const bool startsInstruction = tokenStartsInstruction(currentToken());
     if (checkTokenType(TokenType::SpecialRegister)) {
         Token token = consumeToken();
@@ -485,6 +500,11 @@ CommandNode Parser::parseCommand()
         && checkTokenType(TokenType::Semicolon);
     if (hasTarget && !declarationWithoutInitializer) {
         expectTokenType(TokenType::Equals, "'='");
+    }
+
+    if (checkKeyword("volatile") && tokenStartsInstruction(lookAheadToken(1))) {
+        consumeToken();
+        command.volatileAccess = true;
     }
 
     if (!declarationWithoutInitializer) {
@@ -578,6 +598,7 @@ ConstDeclNode Parser::parseConstDeclaration()
 {
     ConstDeclNode decl;
     decl.type = parseType();
+    decl.type.isConst = true;
     Token nameToken = expectTokenType(TokenType::Identifier, "a constant name");
     decl.name = nameToken.text;
     expectTokenType(TokenType::Equals, "'='");

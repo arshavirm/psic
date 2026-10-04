@@ -159,8 +159,14 @@ void atomicStoreByte(llvm::IRBuilder<>& builder, llvm::Value* address,
 } // namespace
 
 llvm::Value* loadValueBytewiseAtomic(llvm::IRBuilder<>& builder, llvm::Type* type,
-    llvm::Value* address)
+    llvm::Value* address, bool isVolatile)
 {
+    if (isVolatile) {
+        auto* load = builder.CreateLoad(type, address);
+        load->setVolatile(true);
+        load->setAlignment(llvm::Align(1));
+        return load;
+    }
     const std::uint64_t size = fixedStoreSize(type, builder);
     llvm::AllocaInst* temporary = createEntryAlloca(builder, type, "atomic.bytes.tmp");
     for (std::uint64_t index = 0; index < size; ++index) {
@@ -176,8 +182,14 @@ llvm::Value* loadValueBytewiseAtomic(llvm::IRBuilder<>& builder, llvm::Type* typ
 }
 
 void storeValueBytewiseAtomic(llvm::IRBuilder<>& builder, llvm::Value* value,
-    llvm::Value* address)
+    llvm::Value* address, bool isVolatile)
 {
+    if (isVolatile) {
+        auto* store = builder.CreateStore(value, address);
+        store->setVolatile(true);
+        store->setAlignment(llvm::Align(1));
+        return;
+    }
     llvm::Type* type = value->getType();
     const std::uint64_t size = fixedStoreSize(type, builder);
     llvm::AllocaInst* temporary = createEntryAlloca(builder, type, "atomic.bytes.tmp");
@@ -370,7 +382,11 @@ bool stepAccessorTypeNode(const State& s, const RegNode& reg, TypeNode& currentT
                                    << "' has no field named '" << accessor.fieldName << "'\n";
             return false;
         }
+        const bool parentConst = currentType.isConst;
+        const bool parentVolatile = currentType.isVolatile;
         currentType = s.structFieldTypes.at(currentType.baseName)[fieldIt->second];
+        currentType.isConst |= parentConst;
+        currentType.isVolatile |= parentVolatile;
         return true;
     }
 
@@ -455,7 +471,8 @@ RegisterAddress resolveRegisterAddress(State& s, const RegNode& reg,
             }
             trapIfAccessRangeWraps(address, pointerLlvmType, builder);
             llvm::Value* pointerValue = loadValueBytewiseAtomic(
-                *builder, pointerLlvmType, address);
+                *builder, pointerLlvmType, address,
+                currentType.isVolatile && currentType.pointerLevel == 0);
 
             const bool laterPointerLoad = std::any_of(
                 reg.accessors.begin() + accessorIndex + 1, reg.accessors.end(),

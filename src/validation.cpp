@@ -306,7 +306,11 @@ TypeNode registerType(const RegNode& reg,
             [&](const ArgNode& candidate) { return candidate.name == accessor.fieldName; });
         require(field != structure->second->fields.end(),
             "struct '" + type.baseName + "' has no field named '" + accessor.fieldName + "'");
+        const bool parentConst = type.isConst;
+        const bool parentVolatile = type.isVolatile;
         type = field->type;
+        type.isConst |= parentConst;
+        type.isVolatile |= parentVolatile;
     }
     return type;
 }
@@ -942,6 +946,18 @@ void validateBlock(const BlockNode& block, const TypeEnvironment& env,
     for (const auto& command : block.commands) {
         activeLocation = command.location;
         if (command.isEmpty) continue;
+        require(!command.volatileAccess || (command.hasInstruction
+                && !command.instruction.isSpecial
+                && (command.instruction.name == "store" || command.instruction.name == "load")),
+            "volatile instruction prefix requires load or store");
+        if (command.hasDeclaredType && command.declaredType.isConst)
+            require(command.hasInstruction || !command.values.empty(),
+                "a const declaration requires an initializer");
+        if (command.targetKind == TargetKind::Register && !command.hasDeclaredType) {
+            TypeNode target = registerType(command.targetRegister, locals, env);
+            require(!target.isConst || target.pointerLevel > 0,
+                "cannot assign to a const value");
+        }
         // Indexed pointer accesses need address-bit checks in codegen.
         auto hasPointerIndex = [](const RegNode& reg) {
             return std::any_of(reg.accessors.begin(), reg.accessors.end(),
@@ -1000,6 +1016,85 @@ void validateBlock(const BlockNode& block, const TypeEnvironment& env,
             const std::string& op = command.instruction.name;
             if (command.instruction.isSpecial) {
                 const std::string special = normalizedInstructionName(op);
+                if (special == "asm") {
+                    require(command.values.size() >= 2
+                            && command.values[0]->kind == ValueKind::String
+                            && command.values[1]->kind == ValueKind::String,
+                        "'#asm' requires assembly and constraint strings before its operands");
+                    require((command.targetKind == TargetKind::None && !command.hasDeclaredType)
+                            || (command.targetKind == TargetKind::Register && command.hasDeclaredType),
+                        "'#asm' results require a typed destination; void assembly has no destination");
+                }
+                if (special == "csrr" || special == "csrw" || special == "csrs"
+                    || special == "csrc") {
+                    require(pointerModel.architecture == Architecture::RISCV32
+                            || pointerModel.architecture == Architecture::RISCV64,
+                        "'#" + special + "' requires a RISC-V target");
+                    require(targetFeatureEnabled(pointerModel.effectiveTargetFeatures, "zicsr"),
+                        "'#" + special + "' requires the Zicsr target feature");
+                    const bool read = special == "csrr";
+                    require(command.values.size() == (read ? 1u : 2u),
+                        "incorrect operand count for '#" + special + "'");
+                    require(command.values[0]->kind == ValueKind::String
+                            || (command.values[0]->kind == ValueKind::Number
+                                && !command.values[0]->numberIsFloat
+                                && command.values[0]->numberAsInt >= 0
+                                && command.values[0]->numberAsInt <= 4095),
+                        "RISC-V CSR must be a name string or a 12-bit CSR number");
+                    if (!read) {
+                        const ValueType value = inferValueType(*command.values[1], locals, env);
+                        require(value.known && isIntegerType(value.type),
+                            "RISC-V CSR value must be an integer");
+                        require(command.targetKind == TargetKind::None,
+                            "RISC-V CSR writes do not produce a result");
+                    } else require(command.targetKind == TargetKind::Register
+                            && command.hasDeclaredType && isIntegerType(command.declaredType),
+                        "'#csrr' requires a declared integer result");
+                }
+                if (special == "mrs" || special == "msr") {
+                    require(pointerModel.architecture == Architecture::AArch64,
+                        "'#" + special + "' requires an AArch64 target");
+                    const bool read = special == "mrs";
+                    require(command.values.size() == (read ? 1u : 2u)
+                            && command.values[0]->kind == ValueKind::String,
+                        "'#" + special + "' requires a system-register name string");
+                    if (!read) {
+                        const ValueType value = inferValueType(*command.values[1], locals, env);
+                        require(value.known && isIntegerType(value.type)
+                                && command.targetKind == TargetKind::None,
+                            "'#msr' requires an integer value and no result");
+                    } else require(command.targetKind == TargetKind::Register
+                            && command.hasDeclaredType && isIntegerType(command.declaredType),
+                        "'#mrs' requires a declared integer result");
+                }
+                if (special == "rdmsr" || special == "wrmsr") {
+                    require(pointerModel.architecture == Architecture::X86
+                            || pointerModel.architecture == Architecture::X86_64,
+                        "'#" + special + "' requires an x86 target");
+                    const bool read = special == "rdmsr";
+                    require(command.values.size() == (read ? 1u : 2u)
+                            && command.values[0]->kind == ValueKind::Number
+                            && !command.values[0]->numberIsFloat
+                            && command.values[0]->numberAsInt >= 0
+                            && command.values[0]->numberAsInt <= 0xffffffffLL,
+                        "'#" + special + "' requires a 32-bit MSR index");
+                    if (read) require(command.targetKind == TargetKind::Register
+                            && command.hasDeclaredType && command.declaredType.baseName == "u64",
+                        "'#rdmsr' requires a u64 result");
+                    else {
+                        const ValueType value = inferValueType(*command.values[1], locals, env);
+                        require(value.known && isIntegerType(value.type)
+                                && command.targetKind == TargetKind::None,
+                            "'#wrmsr' requires an integer value and no result");
+                    }
+                }
+                if (special == "fence_io" || special == "sfence_vma") {
+                    require(pointerModel.architecture == Architecture::RISCV32
+                            || pointerModel.architecture == Architecture::RISCV64,
+                        "'#" + special + "' requires a RISC-V target");
+                    require(command.values.empty() && command.targetKind == TargetKind::None,
+                        "'#" + special + "' takes no operands and produces no result");
+                }
                 if (special == "int") {
                     require(pointerModel.architecture == Architecture::X86
                             || pointerModel.architecture == Architecture::X86_64,
@@ -1060,7 +1155,8 @@ void validateBlock(const BlockNode& block, const TypeEnvironment& env,
                             "'#syscall' operands must be scalar integers");
                     }
                 }
-                if (special == "inb" || special == "outb")
+                if (special == "inb" || special == "outb" || special == "inw"
+                    || special == "inl" || special == "outw" || special == "outl")
                     require(supportsNativeSpecialInstruction(
                                 pointerModel.architecture, special),
                         "'#" + special + "' requires an x86 target");
@@ -1232,7 +1328,8 @@ void validateBlock(const BlockNode& block, const TypeEnvironment& env,
                     require(command.values.empty(), "'#" + special + "' takes no operands");
                 if (special == "trap" || special == "nop" || special == "cpu_relax"
                     || special == "hlt" || special == "cli" || special == "sti"
-                    || special == "memcpy" || special == "memset" || special == "outb")
+                    || special == "memcpy" || special == "memset" || special == "outb"
+                    || special == "outw" || special == "outl")
                     require(command.targetKind == TargetKind::None,
                         "'#" + special + "' does not produce a result");
                 if (special == "memcpy" || special == "memset") {
@@ -1264,18 +1361,20 @@ void validateBlock(const BlockNode& block, const TypeEnvironment& env,
                         require(byte.known && isIntegerType(byte.type), "'#memset' byte value must be an integer");
                     }
                 }
-                if (special == "inb") {
+                if (special == "inb" || special == "inw" || special == "inl") {
+                    const std::string resultType = special == "inb" ? "u8" : special == "inw" ? "u16" : "u32";
                     require(command.values.size() == 1, "'#inb' requires one port operand");
-                    require(command.hasDeclaredType && command.declaredType.baseName == "u8"
+                    require(command.hasDeclaredType && command.declaredType.baseName == resultType
                             && command.declaredType.pointerLevel == 0,
-                        "'#inb' requires an explicitly declared u8 result");
+                        "'#" + special + "' requires an explicitly declared " + resultType + " result");
                 }
-                if (special == "outb")
+                if (special == "outb" || special == "outw" || special == "outl")
                     require(command.values.size() == 2, "'#outb' requires port and value operands");
-                if (special == "inb" || special == "outb") {
+                if (special == "inb" || special == "outb" || special == "inw"
+                    || special == "inl" || special == "outw" || special == "outl") {
                     ValueType port = inferValueType(*command.values[0], locals, env);
                     require(port.known && isIntegerType(port.type), "'#" + special + "' port must be an integer");
-                    if (special == "outb") {
+                    if (special.front() == 'o') {
                         ValueType value = inferValueType(*command.values[1], locals, env);
                         require(value.known && isIntegerType(value.type), "'#outb' value must be an integer");
                     }
@@ -1410,6 +1509,10 @@ void validateBlock(const BlockNode& block, const TypeEnvironment& env,
             && command.instruction.name == "ref" && !command.values.empty()
             && command.values[0]->kind == ValueKind::Register) {
             const RegNode& referenced = command.values[0]->registerValue;
+            const TypeNode referencedType = registerType(referenced, locals, env);
+            require(!referencedType.isConst
+                    || (referencedType.pointerLevel > 0 && referenced.accessors.empty()),
+                "cannot take a writable reference to const storage");
             const bool isLocal = locals.find(referenced.name) != locals.end();
             const bool referencesImmutableBacking = std::any_of(referenced.accessors.begin(),
                 referenced.accessors.end(), [](const AccessorNode& accessor) {

@@ -8,6 +8,7 @@
 #include <llvm/IR/IntrinsicsWebAssembly.h>
 #include <llvm/IR/IntrinsicsX86.h>
 #include <llvm/IR/Verifier.h>
+#include <llvm/Support/Error.h>
 
 #include <algorithm>
 #include <cmath>
@@ -124,7 +125,8 @@ llvm::Value* processValue(State& s, const ValueNode& value, llvm::IRBuilder<>* b
             trapIfNullPointer(access.address, builder);
             trapIfAccessRangeWraps(access.address, llvmType, builder);
         }
-        return loadValueBytewiseAtomic(*builder, llvmType, access.address);
+        return loadValueBytewiseAtomic(*builder, llvmType, access.address,
+            access.typeNode.isVolatile && access.typeNode.pointerLevel == 0);
     }
     case ValueKind::SpecialRegister:
         return processSpecialRegisterRead(s, value.specialRegisterValue, builder);
@@ -1026,6 +1028,14 @@ NativeInstructionResult processNativeInstruction(State& s, const std::string& na
         }
     }
     if (riscv) {
+        if (name == "fence_io") {
+            assembly = "fence iorw, iorw";
+            memoryBarrier = true;
+        }
+        if (name == "sfence_vma") {
+            assembly = "sfence.vma";
+            memoryBarrier = true;
+        }
         if (name == "ecall" || name == "ebreak" || name == "wfi") {
             assembly = name;
             memoryBarrier = true;
@@ -1242,6 +1252,74 @@ llvm::Value* processSpecialInstruction(State& s,
 {
     std::string name = command.instruction.name;
     std::replace(name.begin(), name.end(), '.', '_');
+
+    if (name == "asm") {
+        std::vector<llvm::Type*> argumentTypes;
+        std::vector<llvm::Value*> arguments;
+        for (std::size_t index = 2; index < command.values.size(); ++index) {
+            auto* argument = processValue(s, *command.values[index], builder);
+            if (!argument) return nullptr;
+            argumentTypes.push_back(argument->getType());
+            arguments.push_back(argument);
+        }
+        auto* resultType = declaredType ? resolveType(s, *declaredType) : builder->getVoidTy();
+        if (!resultType) return nullptr;
+        auto* signature = llvm::FunctionType::get(resultType, argumentTypes, false);
+        const std::string& constraints = command.values[1]->stringValue;
+        if (auto error = llvm::InlineAsm::verify(signature, constraints)) {
+            psi::logError("invalid #asm constraints: " + llvm::toString(std::move(error)));
+            return nullptr;
+        }
+        return builder->CreateCall(llvm::InlineAsm::get(signature,
+            command.values[0]->stringValue, constraints, true), arguments);
+    }
+    if (name == "csrr" || name == "csrw" || name == "csrs" || name == "csrc"
+        || name == "mrs" || name == "msr") {
+        const bool read = name == "csrr" || name == "mrs";
+        const bool arm = name == "mrs" || name == "msr";
+        const unsigned width = arm || s.architecture == Architecture::RISCV64 ? 64 : 32;
+        auto* word = builder->getIntNTy(width);
+        const ValueNode& registerValue = *command.values[0];
+        const std::string reg = registerValue.kind == ValueKind::String
+            ? registerValue.stringValue : std::to_string(registerValue.numberAsInt);
+        if (read) {
+            auto* signature = llvm::FunctionType::get(word, false);
+            const std::string assembly = arm ? "mrs $0, " + reg : "csrr $0, " + reg;
+            return builder->CreateCall(llvm::InlineAsm::get(signature, assembly, "=r,~{memory}", true));
+        }
+        auto* value = processValue(s, *command.values[1], builder);
+        if (!value) return nullptr;
+        value = coerceValue(value, word, builder, "system register value", true);
+        if (!value) return nullptr;
+        auto* signature = llvm::FunctionType::get(builder->getVoidTy(), {word}, false);
+        builder->CreateCall(llvm::InlineAsm::get(signature,
+            name + " " + reg + ", $0", "r,~{memory}", true), {value});
+        return nullptr;
+    }
+    if (name == "rdmsr" || name == "wrmsr") {
+        auto* index = processValue(s, *command.values[0], builder);
+        if (!index) return nullptr;
+        index = builder->CreateZExtOrTrunc(index, builder->getInt32Ty());
+        if (name == "rdmsr") {
+            auto* pair = llvm::StructType::get(builder->getContext(), {builder->getInt32Ty(), builder->getInt32Ty()});
+            auto* signature = llvm::FunctionType::get(pair, {builder->getInt32Ty()}, false);
+            auto* result = builder->CreateCall(llvm::InlineAsm::get(signature, "rdmsr",
+                "={eax},={edx},{ecx},~{memory}", true), {index});
+            auto* low = builder->CreateZExt(builder->CreateExtractValue(result, 0), builder->getInt64Ty());
+            auto* high = builder->CreateZExt(builder->CreateExtractValue(result, 1), builder->getInt64Ty());
+            return builder->CreateOr(low, builder->CreateShl(high, 32));
+        }
+        auto* value = processValue(s, *command.values[1], builder);
+        if (!value) return nullptr;
+        value = builder->CreateZExtOrTrunc(value, builder->getInt64Ty());
+        auto* low = builder->CreateTrunc(value, builder->getInt32Ty());
+        auto* high = builder->CreateTrunc(builder->CreateLShr(value, 32), builder->getInt32Ty());
+        auto* signature = llvm::FunctionType::get(builder->getVoidTy(),
+            {builder->getInt32Ty(), builder->getInt32Ty(), builder->getInt32Ty()}, false);
+        builder->CreateCall(llvm::InlineAsm::get(signature, "wrmsr",
+            "{ecx},{eax},{edx},~{memory}", true), {index, low, high});
+        return nullptr;
+    }
 
     const bool viewLength = name == "view_len" || name == "viewlen";
     const bool viewLoad = name == "view_load" || name == "viewload";
@@ -1538,12 +1616,16 @@ llvm::Value* processSpecialInstruction(State& s,
     if (name == "memcpy" || name == "memset")
         return processMemoryIntrinsicInstruction(s, name, command, builder);
 
-    if (name == "inb" || name == "outb") {
+    if (name == "inb" || name == "inw" || name == "inl"
+        || name == "outb" || name == "outw" || name == "outl") {
         if (!x86) {
             psi::ErrorStream() << "'#" << name << "' requires x86\n";
             return nullptr;
         }
-        const std::size_t expected = name == "inb" ? 1 : 2;
+        const bool input = name.front() == 'i';
+        const unsigned width = name.back() == 'b' ? 8 : name.back() == 'w' ? 16 : 32;
+        const std::string accumulator = width == 8 ? "{al}" : width == 16 ? "{ax}" : "{eax}";
+        const std::size_t expected = input ? 1 : 2;
         if (command.values.size() != expected) {
             psi::ErrorStream() << "'#" << name << "' requires " << expected << " operand(s)\n";
             return nullptr;
@@ -1554,18 +1636,20 @@ llvm::Value* processSpecialInstruction(State& s,
             return nullptr;
         }
         port = builder->CreateZExtOrTrunc(port, builder->getInt16Ty());
-        if (name == "inb") {
-            auto* type = llvm::FunctionType::get(builder->getInt8Ty(), {builder->getInt16Ty()}, false);
-            return builder->CreateCall(llvm::InlineAsm::get(type, "inb $1, $0", "={al},{dx},~{memory}", true), {port});
+        if (input) {
+            auto* type = llvm::FunctionType::get(builder->getIntNTy(width), {builder->getInt16Ty()}, false);
+            return builder->CreateCall(llvm::InlineAsm::get(type, name + " $1, $0",
+                "=" + accumulator + ",{dx},~{memory}", true), {port});
         }
         auto* value = processValue(s, *command.values[1], builder);
         if (!value || !value->getType()->isIntegerTy()) {
-            psi::ErrorStream() << "'#outb' value must be an integer\n";
+            psi::ErrorStream() << "'#" << name << "' value must be an integer\n";
             return nullptr;
         }
-        value = builder->CreateZExtOrTrunc(value, builder->getInt8Ty());
-        auto* type = llvm::FunctionType::get(builder->getVoidTy(), {builder->getInt8Ty(), builder->getInt16Ty()}, false);
-        builder->CreateCall(llvm::InlineAsm::get(type, "outb $0, $1", "{al},{dx},~{memory}", true), {value, port});
+        value = builder->CreateZExtOrTrunc(value, builder->getIntNTy(width));
+        auto* type = llvm::FunctionType::get(builder->getVoidTy(), {builder->getIntNTy(width), builder->getInt16Ty()}, false);
+        builder->CreateCall(llvm::InlineAsm::get(type, name + " $0, $1",
+            accumulator + ",{dx},~{memory}", true), {value, port});
         return nullptr;
     }
 
@@ -1716,7 +1800,10 @@ void processUntargetedInstruction(State& s, const CommandNode& command, llvm::IR
         }
         trapIfNullPointer(pointer, builder);
         trapIfAccessRangeWraps(pointer, value->getType(), builder);
-        storeValueWithZeroedPadding(*builder, value, pointer);
+        if (command.volatileAccess || pointerType.isVolatile)
+            storeValueBytewiseAtomic(*builder, value, pointer, true);
+        else
+            storeValueWithZeroedPadding(*builder, value, pointer);
         return;
     }
 
@@ -1784,7 +1871,11 @@ void processLocalDeclaration(State& s, const CommandNode& command, llvm::IRBuild
     const std::string& name = command.targetRegister.name;
     auto existing = s.locals.find(name);
     if (existing != s.locals.end()) {
-        if (hasInitializer) storeValueWithZeroedPadding(*builder, value, existing->second);
+        if (hasInitializer) {
+            if (command.declaredType.isVolatile)
+                storeValueBytewiseAtomic(*builder, value, existing->second, true);
+            else storeValueWithZeroedPadding(*builder, value, existing->second);
+        }
         return;
     }
 
@@ -1801,7 +1892,11 @@ void processLocalDeclaration(State& s, const CommandNode& command, llvm::IRBuild
     s.locals[name] = slot;
     s.localTypes[name] = command.declaredType;
     s.declaredLocalNames.push_back(name);
-    if (hasInitializer) storeValueWithZeroedPadding(*builder, value, slot);
+    if (hasInitializer) {
+        if (command.declaredType.isVolatile)
+            storeValueBytewiseAtomic(*builder, value, slot, true);
+        else storeValueWithZeroedPadding(*builder, value, slot);
+    }
 }
 
 void processRegisterAssignment(State& s, const CommandNode& command, llvm::IRBuilder<>* builder)
@@ -1822,7 +1917,9 @@ void processRegisterAssignment(State& s, const CommandNode& command, llvm::IRBui
     value = coerceValue(value, targetType, builder, "assignment to '" + command.targetRegister.name + "'",
         isUnsignedTypeName(access.typeNode.baseName));
     if (value) {
-        storeValueWithZeroedPadding(*builder, value, access.address);
+        if (access.typeNode.isVolatile && access.typeNode.pointerLevel == 0)
+            storeValueBytewiseAtomic(*builder, value, access.address, true);
+        else storeValueWithZeroedPadding(*builder, value, access.address);
     }
 }
 
@@ -2057,7 +2154,11 @@ llvm::Value* computeCommandValue(State& s, const CommandNode& command, llvm::IRB
             }
             trapIfNullPointer(p, builder);
             trapIfAccessRangeWraps(p, type, builder);
-            return loadValueBytewiseAtomic(*builder, type, p);
+            const bool volatilePointer = command.values[0]->kind == ValueKind::Register
+                && resolveRegisterTypeNode(s, command.values[0]->registerValue, pointerType)
+                && pointerType.isVolatile;
+            return loadValueBytewiseAtomic(*builder, type, p, command.volatileAccess
+                || volatilePointer || (declaredType && declaredType->isVolatile));
         }
         if (op == "not") {
             auto* v = processValue(s, *command.values[0], builder);

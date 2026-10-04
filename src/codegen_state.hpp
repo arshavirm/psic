@@ -88,9 +88,9 @@ struct RegisterAddress {
 void storeValueWithZeroedPadding(llvm::IRBuilder<>& builder, llvm::Value* value,
     llvm::Value* address);
 llvm::Value* loadValueBytewiseAtomic(llvm::IRBuilder<>& builder, llvm::Type* type,
-    llvm::Value* address);
+    llvm::Value* address, bool isVolatile = false);
 void storeValueBytewiseAtomic(llvm::IRBuilder<>& builder, llvm::Value* value,
-    llvm::Value* address);
+    llvm::Value* address, bool isVolatile = false);
 void trapIfCondition(llvm::Value* condition, const char* blockPrefix,
     llvm::IRBuilder<>* builder);
 void trapIfNullPointer(llvm::Value* pointer, llvm::IRBuilder<>* builder);

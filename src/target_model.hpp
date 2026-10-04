@@ -68,7 +68,8 @@ inline bool supportsNativeSpecialInstruction(Architecture architecture,
         return name == "pause" || name == "lfence" || name == "sfence"
             || name == "mfence" || name == "hlt" || name == "cli"
             || name == "sti" || name == "inb" || name == "outb"
-            || name == "rdtsc";
+            || name == "rdtsc" || name == "inw" || name == "inl"
+            || name == "outw" || name == "outl";
     case Architecture::ARM:
         return name == "yield" || name == "dmb" || name == "dsb"
             || name == "isb" || name == "wfi" || name == "wfe" || name == "sev";
@@ -79,7 +80,7 @@ inline bool supportsNativeSpecialInstruction(Architecture architecture,
     case Architecture::RISCV32:
     case Architecture::RISCV64:
         return name == "ecall" || name == "ebreak" || name == "wfi"
-            || name == "fence_i";
+            || name == "fence_i" || name == "fence_io" || name == "sfence_vma";
     case Architecture::PPC32:
     case Architecture::PPC64:
     case Architecture::PPC64LE:

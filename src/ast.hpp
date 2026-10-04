@@ -12,6 +12,8 @@ struct TypeNode {
     int alignment = 0;
     bool isPrimitive = false;
     bool isView = false;
+    bool isConst = false;
+    bool isVolatile = false;
 };
 
 struct SourceLocation {
@@ -94,6 +96,7 @@ enum class TargetKind {
 struct CommandNode {
     SourceLocation location;
     bool isEmpty = false;
+    bool volatileAccess = false;
 
     bool hasDeclaredType = false;
     TypeNode declaredType;
